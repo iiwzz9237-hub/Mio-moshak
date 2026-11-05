@@ -2,2539 +2,1103 @@
 <html lang="fa" dir="rtl">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="theme-color" content="#050813">
-<meta name="color-scheme" content="dark">
-<title>ROCKET CRASH — INFINITE SPACE</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="theme-color" content="#050713">
+<title>Rocket Live</title>
+
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script type="module">
+import {initializeApp} from "https://www.gstatic.com/firebasejs/11.2.0/firebase-app.js";
+import {
+  getAuth,
+  signInAnonymously
+} from "https://www.gstatic.com/firebasejs/11.2.0/firebase-auth.js";
+import {
+  getDatabase,
+  ref,
+  onValue,
+  set,
+  update,
+  runTransaction,
+  onDisconnect
+} from "https://www.gstatic.com/firebasejs/11.2.0/firebase-database.js";
+
+/*
+  اطلاعات پروژه Firebase خودت را وارد کن.
+  در Firebase باید Anonymous Authentication و Realtime Database فعال باشند.
+
+  این نسخه فقط یک نمونه HTML است. برای جلوگیری واقعی از تقلب، اعتبارسنجی
+  initData تلگرام، زمان برداشت و ضریب انفجار باید روی سرور انجام شود.
+*/
+const FIREBASE_CONFIG = {
+  apiKey: "YOUR_FIREBASE_API_KEY",
+  authDomain: "YOUR_PROJECT.firebaseapp.com",
+  databaseURL: "https://YOUR_PROJECT-default-rtdb.firebaseio.com",
+  projectId: "YOUR_PROJECT_ID",
+  appId: "YOUR_FIREBASE_APP_ID"
+};
+
+const ROOM_ID = "global-room";
+const WAITING_LIMIT = 30000;
+const NEXT_ROUND_DELAY = 6000;
+
+const app = initializeApp(FIREBASE_CONFIG);
+const auth = getAuth(app);
+const db = getDatabase(app);
+
+const $ = id => document.getElementById(id);
+const tg = window.Telegram?.WebApp;
+
+if (tg) {
+  tg.ready();
+  tg.expand();
+  tg.disableVerticalSwipes?.();
+  tg.setHeaderColor?.("#050713");
+  tg.setBackgroundColor?.("#050713");
+}
+
+const fa = value => String(value)
+  .replace(/\d/g, d => "۰۱۲۳۴۵۶۷۸۹"[d])
+  .replace(".", "٫");
+
+const formatMultiplier = value =>
+  fa(Number(value || 1).toFixed(2)) + "×";
+
+const formatMoney = value =>
+  fa(Math.floor(Number(value || 0))
+    .toLocaleString("en-US")
+    .replaceAll(",", "٬"));
+
+const safeText = value =>
+  String(value || "").replace(/[<>&"']/g, "");
+
+const telegramUser = tg?.initDataUnsafe?.user || {
+  id: "browser-" + Math.random().toString(36).slice(2),
+  first_name: "کاربر",
+  username: "",
+  photo_url: ""
+};
+
+const profile = {
+  telegramId: String(telegramUser.id),
+  name: safeText(
+    [telegramUser.first_name, telegramUser.last_name]
+      .filter(Boolean).join(" ")
+  ).slice(0, 50) || "کاربر",
+  username: safeText(telegramUser.username || "").slice(0, 40),
+  photo: String(telegramUser.photo_url || "").slice(0, 500)
+};
+
+let uid = "";
+let round = null;
+let players = {};
+let serverOffset = 0;
+let animationId = 0;
+let lastSecond = -1;
+let leavingRef = null;
+
+const roundRef = ref(db, `rooms/${ROOM_ID}/round`);
+const playersRoot = ref(db, `rooms/${ROOM_ID}/players`);
+const offsetRef = ref(db, ".info/serverTimeOffset");
+
+function now() {
+  return Date.now() + serverOffset;
+}
+
+function randomId() {
+  return crypto.randomUUID?.() ||
+    Date.now().toString(36) + Math.random().toString(36).slice(2);
+}
+
+function randomCrash() {
+  const u = crypto.getRandomValues(new Uint32Array(1))[0] / 4294967296;
+  return Math.min(100, Math.max(
+    1,
+    Math.floor(Math.pow(1 - u, -1 / 1.15) * 100) / 100
+  ));
+}
+
+function flightDuration(multiplier) {
+  return Math.max(
+    500,
+    Math.log(Math.max(1, multiplier)) / 0.095 * 1000
+  );
+}
+
+function multiplierAt(time) {
+  if (!round || round.status !== "flying") return 1;
+
+  const elapsed = Math.max(0, time - round.startsAt) / 1000;
+  return Math.min(
+    round.crashMultiplier,
+    Math.exp(elapsed * 0.095)
+  );
+}
+
+function myPlayer() {
+  if (!round?.id || !uid) return null;
+  return players[round.id]?.[uid] || null;
+}
+
+function isOwner() {
+  return Boolean(round && round.ownerUid === uid);
+}
+
+function feedback(style = "light") {
+  tg?.HapticFeedback?.impactOccurred?.(style);
+}
+
+function toast(message) {
+  const node = $("toast");
+  node.textContent = message;
+  node.classList.add("show");
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => node.classList.remove("show"), 2200);
+}
+
+async function createRound() {
+  const stake = readStake();
+  if (!stake) return;
+
+  feedback("medium");
+
+  const id = randomId();
+  const created = now();
+
+  const result = await runTransaction(roundRef, current => {
+    const canCreate =
+      !current ||
+      current.status === "idle" ||
+      (
+        current.status === "crashed" &&
+        created - Number(current.endedAt || 0) >= NEXT_ROUND_DELAY
+      );
+
+    if (!canCreate) return;
+
+    return {
+      id,
+      status: "waiting",
+      ownerUid: uid,
+      ownerTelegramId: profile.telegramId,
+      ownerName: profile.name,
+      createdAt: created,
+      waitingUntil: created + WAITING_LIMIT
+    };
+  });
+
+  if (!result.committed) {
+    toast("یک دور فعال است");
+    return;
+  }
+
+  await joinRound();
+}
+
+async function joinRound() {
+  if (!round?.id || round.status !== "waiting") return;
+
+  const stake = readStake();
+  if (!stake) return;
+
+  feedback("light");
+
+  const playerRef = ref(
+    db,
+    `rooms/${ROOM_ID}/players/${round.id}/${uid}`
+  );
+
+  await runTransaction(playerRef, current => {
+    if (current) return current;
+
+    return {
+      ...profile,
+      uid,
+      stake,
+      joinedAt: now(),
+      online: true,
+      cashMultiplier: null,
+      payout: null,
+      cashedAt: null
+    };
+  });
+
+  leavingRef = playerRef;
+  onDisconnect(playerRef).update({online: false});
+}
+
+async function launchRound() {
+  if (!round || round.status !== "waiting" || !isOwner()) return;
+
+  const count = Object.keys(players[round.id] || {}).length;
+  if (!count) {
+    toast("هنوز کسی جوین نشده");
+    return;
+  }
+
+  feedback("heavy");
+
+  const startsAt = now() + 3000;
+  const crashMultiplier = randomCrash();
+  const crashAt = startsAt + flightDuration(crashMultiplier);
+
+  await runTransaction(roundRef, current => {
+    if (
+      !current ||
+      current.id !== round.id ||
+      current.status !== "waiting" ||
+      current.ownerUid !== uid
+    ) return;
+
+    return {
+      ...current,
+      status: "flying",
+      startsAt,
+      crashAt,
+      crashMultiplier
+    };
+  });
+}
+
+async function cashOut() {
+  const player = myPlayer();
+
+  if (
+    !round ||
+    round.status !== "flying" ||
+    !player ||
+    player.cashMultiplier
+  ) return;
+
+  const clickTime = now();
+
+  if (clickTime >= round.crashAt) {
+    toast("موشک منفجر شد");
+    return;
+  }
+
+  const currentMultiplier = Math.floor(
+    multiplierAt(clickTime) * 100
+  ) / 100;
+
+  const playerRef = ref(
+    db,
+    `rooms/${ROOM_ID}/players/${round.id}/${uid}`
+  );
+
+  const result = await runTransaction(playerRef, current => {
+    if (!current || current.cashMultiplier) return;
+
+    return {
+      ...current,
+      cashMultiplier: currentMultiplier,
+      payout: Math.floor(current.stake * currentMultiplier),
+      cashedAt: clickTime
+    };
+  });
+
+  if (result.committed) {
+    feedback("medium");
+    tg?.HapticFeedback?.notificationOccurred?.("success");
+    toast("برداشت ثبت شد");
+  }
+}
+
+async function finishRound() {
+  if (!round || round.status !== "flying" || now() < round.crashAt) return;
+
+  await runTransaction(roundRef, current => {
+    if (
+      !current ||
+      current.id !== round.id ||
+      current.status !== "flying" ||
+      now() < current.crashAt
+    ) return;
+
+    return {
+      ...current,
+      status: "crashed",
+      endedAt: current.crashAt
+    };
+  });
+}
+
+function readStake() {
+  const normalized = $("stake").value
+    .replace(/[۰-۹]/g, c => "۰۱۲۳۴۵۶۷۸۹".indexOf(c))
+    .replace(/[٬,\s]/g, "");
+
+  const stake = Number(normalized);
+
+  if (!Number.isFinite(stake) || stake < 1 || stake > 1e9) {
+    toast("مبلغ معتبر وارد کن");
+    $("stake").focus();
+    return null;
+  }
+
+  return Math.floor(stake);
+}
+
+function playerAvatar(player) {
+  const letter = safeText(player.name?.trim()?.[0] || "؟");
+
+  return player.photo
+    ? `<img src="${safeText(player.photo)}" alt="">`
+    : `<span>${letter}</span>`;
+}
+
+function renderPlayers() {
+  const list = $("players");
+  const entries = round?.id
+    ? Object.values(players[round.id] || {})
+    : [];
+
+  $("player-count").textContent = fa(entries.length);
+
+  if (!entries.length) {
+    list.innerHTML = "";
+    return;
+  }
+
+  list.innerHTML = entries
+    .sort((a, b) =>
+      Number(a.joinedAt || 0) - Number(b.joinedAt || 0)
+    )
+    .map(player => {
+      const cashed = Boolean(player.cashMultiplier);
+      const username = player.username
+        ? `@${safeText(player.username)}`
+        : safeText(player.name);
+
+      return `
+        <article class="player ${cashed ? "cashed" : ""}">
+          <div class="avatar">${playerAvatar(player)}</div>
+          <div class="player-info">
+            <strong>${username}</strong>
+            <small>
+              ${
+                cashed
+                  ? `${formatMultiplier(player.cashMultiplier)} · ${formatMoney(player.payout)}`
+                  : formatMoney(player.stake)
+              }
+            </small>
+          </div>
+          <i>${cashed ? "✓" : ""}</i>
+        </article>
+      `;
+    }).join("");
+}
+
+function renderControls() {
+  const button = $("action");
+  const player = myPlayer();
+  const waiting = round?.status === "waiting";
+  const flying = round?.status === "flying";
+  const crashed = round?.status === "crashed";
+  const joined = Boolean(player);
+
+  $("stake-wrap").classList.toggle(
+    "locked",
+    joined || flying || crashed
+  );
+
+  $("stake").disabled = joined || flying || crashed;
+
+  button.disabled = false;
+  button.className = "action";
+
+  if (!round || round.status === "idle") {
+    button.textContent = "ساخت دور";
+    button.onclick = createRound;
+    return;
+  }
+
+  if (waiting && !joined) {
+    button.textContent = "پیوستن";
+    button.classList.add("join");
+    button.onclick = joinRound;
+    return;
+  }
+
+  if (waiting && joined && isOwner()) {
+    button.textContent = "پرتاب";
+    button.classList.add("launch");
+    button.onclick = launchRound;
+    return;
+  }
+
+  if (waiting && joined) {
+    button.textContent = "منتظر پرتاب";
+    button.classList.add("disabled");
+    button.disabled = true;
+    button.onclick = null;
+    return;
+  }
+
+  if (flying && joined && !player.cashMultiplier) {
+    const value = Math.floor(
+      player.stake * multiplierAt(now())
+    );
+
+    button.textContent = `برداشت ${formatMoney(value)}`;
+    button.classList.add("cash");
+    button.onclick = cashOut;
+    return;
+  }
+
+  if (flying && joined && player.cashMultiplier) {
+    button.textContent =
+      `برداشت شد · ${formatMultiplier(player.cashMultiplier)}`;
+    button.classList.add("done");
+    button.disabled = true;
+    button.onclick = null;
+    return;
+  }
+
+  if (flying && !joined) {
+    button.textContent = "پرواز شروع شده";
+    button.classList.add("disabled");
+    button.disabled = true;
+    button.onclick = null;
+    return;
+  }
+
+  if (crashed) {
+    button.textContent = "انفجار";
+    button.classList.add("crashed");
+    button.disabled = true;
+    button.onclick = null;
+  }
+}
+
+function renderStatus(time) {
+  const multiplierNode = $("multiplier");
+  const statusNode = $("status");
+  const rocket = $("rocket");
+
+  multiplierNode.className = "multiplier";
+  rocket.className = "rocket";
+
+  if (!round || round.status === "idle") {
+    multiplierNode.textContent = "۱٫۰۰×";
+    statusNode.textContent = "آماده";
+    return;
+  }
+
+  if (round.status === "waiting") {
+    const remaining = Math.max(
+      0,
+      Math.ceil((round.waitingUntil - time) / 1000)
+    );
+
+    multiplierNode.textContent = fa(remaining);
+    statusNode.textContent = isOwner()
+      ? "بازیکن‌ها می‌توانند جوین شوند"
+      : "در انتظار پرتاب";
+    return;
+  }
+
+  if (round.status === "flying") {
+    if (time < round.startsAt) {
+      const countdown = Math.max(
+        1,
+        Math.ceil((round.startsAt - time) / 1000)
+      );
+
+      multiplierNode.textContent = fa(countdown);
+      statusNode.textContent = "پرتاب";
+      rocket.classList.add("ignite");
+      return;
+    }
+
+    const value = multiplierAt(time);
+    multiplierNode.textContent = formatMultiplier(value);
+    statusNode.textContent = "پرواز زنده";
+    rocket.classList.add("flying");
+
+    if (time >= round.crashAt) finishRound();
+    return;
+  }
+
+  if (round.status === "crashed") {
+    multiplierNode.textContent =
+      formatMultiplier(round.crashMultiplier);
+
+    multiplierNode.classList.add("lost");
+    statusNode.textContent = "انفجار";
+    rocket.classList.add("boom");
+  }
+}
+
+function render(time = now()) {
+  renderStatus(time);
+  renderPlayers();
+  renderControls();
+
+  cancelAnimationFrame(animationId);
+  animationId = requestAnimationFrame(loop);
+}
+
+function loop() {
+  const time = now();
+  renderStatus(time);
+
+  if (round?.status === "flying") {
+    renderControls();
+  }
+
+  if (round?.status === "waiting") {
+    const second = Math.floor((round.waitingUntil - time) / 1000);
+
+    if (second !== lastSecond) {
+      lastSecond = second;
+      renderControls();
+    }
+  }
+
+  animationId = requestAnimationFrame(loop);
+}
+
+onValue(offsetRef, snapshot => {
+  serverOffset = Number(snapshot.val() || 0);
+});
+
+onValue(roundRef, snapshot => {
+  round = snapshot.val();
+
+  if (
+    round?.status === "crashed" &&
+    now() - Number(round.endedAt || 0) >= NEXT_ROUND_DELAY
+  ) {
+    runTransaction(roundRef, current => {
+      if (
+        current?.id === round.id &&
+        current.status === "crashed" &&
+        now() - Number(current.endedAt || 0) >= NEXT_ROUND_DELAY
+      ) {
+        return {status: "idle", updatedAt: now()};
+      }
+      return;
+    });
+  }
+
+  render();
+});
+
+onValue(playersRoot, snapshot => {
+  players = snapshot.val() || {};
+  renderPlayers();
+  renderControls();
+});
+
+$("stake").addEventListener("input", event => {
+  event.target.value = event.target.value
+    .replace(/[^\d۰-۹٬,]/g, "");
+});
+
+async function boot() {
+  try {
+    const credential = await signInAnonymously(auth);
+    uid = credential.user.uid;
+
+    $("me-name").textContent = profile.username
+      ? `@${profile.username}`
+      : profile.name;
+
+    $("me-avatar").innerHTML = playerAvatar(profile);
+
+    set(ref(db, `presence/${uid}`), {
+      telegramId: profile.telegramId,
+      name: profile.name,
+      online: true,
+      updatedAt: now()
+    });
+
+    onDisconnect(ref(db, `presence/${uid}`)).update({
+      online: false,
+      updatedAt: Date.now()
+    });
+
+    render();
+  } catch (error) {
+    console.error(error);
+    $("action").textContent = "خطای اتصال";
+    $("action").disabled = true;
+    toast("تنظیمات Firebase را بررسی کن");
+  }
+}
+
+boot();
+</script>
+
 <style>
 :root{
-  --bg:#050813;--panel:rgba(13,21,40,.84);
-  --line:rgba(173,197,255,.14);--text:#f2f6ff;--muted:#9caecb;
-  --cyan:#64e7ff;--purple:#a58aff;--green:#73ffc5;
-  --orange:#ffa65c;--red:#ff647e;
+  color-scheme:dark;
+  --bg:#050713;
+  --panel:#0d1424e8;
+  --line:#a9c1ef22;
+  --text:#f4f7ff;
+  --muted:#8999b6;
+  --cyan:#60eaff;
+  --blue:#409cff;
+  --green:#69ffc0;
+  --red:#ff5e7d;
   --safe:env(safe-area-inset-bottom,0px)
 }
 *{box-sizing:border-box}
 html,body{
-  margin:0;width:100%;height:100%;background:var(--bg);
-  color:var(--text);font-family:Tahoma,Arial,sans-serif
+  margin:0;
+  width:100%;
+  height:100%;
+  overflow:hidden;
+  background:var(--bg);
+  color:var(--text);
+  font-family:Tahoma,Arial,sans-serif
 }
-body{overflow:hidden}
 button,input{font:inherit}
-button{
-  cursor:pointer;-webkit-tap-highlight-color:transparent;
-  touch-action:manipulation;color:inherit
+button{color:inherit}
+body:before{
+  content:"";
+  position:fixed;
+  inset:0;
+  pointer-events:none;
+  background:
+    radial-gradient(circle at 20% 20%,#46258d55,transparent 32%),
+    radial-gradient(circle at 80% 65%,#124c8e55,transparent 34%),
+    radial-gradient(circle at 50% 110%,#254d8055,transparent 42%)
 }
-button:disabled{cursor:default}
-button:focus-visible,input:focus-visible{
-  outline:2px solid var(--cyan);outline-offset:4px
+body:after{
+  content:"";
+  position:fixed;
+  inset:0;
+  pointer-events:none;
+  opacity:.38;
+  background-image:
+    radial-gradient(circle,#fff 0 1px,transparent 1.4px),
+    radial-gradient(circle,#8fdcff 0 1px,transparent 1.5px);
+  background-position:0 0,40px 70px;
+  background-size:93px 93px,137px 137px
 }
-svg{
-  width:20px;height:20px;fill:none;stroke:currentColor;
-  stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round
-}
-button svg{pointer-events:none}
-#space{position:fixed;inset:0;width:100%;height:100%;pointer-events:none}
 .app{
-  height:100vh;height:100dvh;max-width:1440px;margin:auto;
-  position:relative;display:flex;flex-direction:column;gap:12px;
-  padding:max(14px,env(safe-area-inset-top))
-    max(18px,env(safe-area-inset-right))
-    max(12px,var(--safe))
-    max(18px,env(safe-area-inset-left))
+  position:relative;
+  z-index:1;
+  width:min(100%,620px);
+  height:100dvh;
+  margin:auto;
+  display:flex;
+  flex-direction:column;
+  padding:
+    max(12px,env(safe-area-inset-top))
+    14px
+    max(12px,var(--safe));
+  gap:12px
 }
-.topbar{
-  display:flex;align-items:center;justify-content:space-between;
-  gap:12px;flex-shrink:0;min-height:48px
+.top{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  min-height:44px
 }
-.brand{direction:ltr;display:flex;gap:10px;align-items:center}
-.brand-symbol{
-  width:38px;height:38px;border:1px solid #64e7ff55;border-radius:12px;
-  display:grid;place-items:center;background:#64e7ff0b;
-  box-shadow:inset 0 0 18px #64e7ff0a
+.logo{
+  direction:ltr;
+  display:flex;
+  align-items:center;
+  gap:9px;
+  font:bold 15px Arial;
+  letter-spacing:1px
 }
-.brand-symbol svg{width:25px;height:25px;color:var(--cyan)}
-.brand strong{
-  font:900 19px Arial,sans-serif;letter-spacing:1px;display:block
+.logo i{
+  width:9px;
+  height:9px;
+  border-radius:50%;
+  background:var(--green);
+  box-shadow:0 0 14px var(--green)
 }
-.brand small{
-  font:9px Arial,sans-serif;letter-spacing:3px;
-  color:var(--muted);display:block;margin-top:4px
+.me{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  min-width:0;
+  color:#ccd7ea;
+  font-size:11px
 }
-.balance{
-  display:flex;align-items:center;gap:9px;border:1px solid var(--line);
-  padding:7px 14px;border-radius:12px;background:#0b1325a8;
-  font-size:10px;color:var(--muted)
+#me-name{
+  max-width:145px;
+  overflow:hidden;
+  white-space:nowrap;
+  text-overflow:ellipsis
 }
-.balance b{font:32px Arial;line-height:1;color:var(--cyan)}
-.tools{display:flex;gap:7px}
-.icon-btn{
-  width:37px;height:37px;display:grid;place-items:center;
-  border:1px solid var(--line);border-radius:11px;background:#0c1528a3;
-  transition:background .2s,transform .15s
+.mini-avatar,.avatar{
+  overflow:hidden;
+  display:grid;
+  place-items:center;
+  flex-shrink:0;
+  border-radius:50%;
+  background:linear-gradient(145deg,#603dd8,#208bd8);
+  color:white;
+  font-weight:bold
 }
-.icon-btn:hover{background:#21304b}
-.icon-btn:active{transform:scale(.92)}
-.icon-btn:disabled{opacity:.35}
-.arena{position:relative;flex:1;min-height:160px;isolation:isolate}
-.corner{position:absolute;width:19px;height:19px;opacity:.42;pointer-events:none}
-.corner.a{
-  top:4px;left:0;border-top:1px solid var(--cyan);
-  border-left:1px solid var(--cyan)
+.mini-avatar{width:33px;height:33px}
+.avatar{width:39px;height:39px}
+.mini-avatar img,.avatar img{
+  width:100%;
+  height:100%;
+  object-fit:cover
 }
-.corner.b{
-  top:4px;right:0;border-top:1px solid var(--cyan);
-  border-right:1px solid var(--cyan)
-}
-.corner.c{
-  bottom:44px;left:0;border-bottom:1px solid var(--cyan);
-  border-left:1px solid var(--cyan)
-}
-.corner.d{
-  bottom:44px;right:0;border-bottom:1px solid var(--cyan);
-  border-right:1px solid var(--cyan)
+.stage{
+  position:relative;
+  flex:1;
+  min-height:250px;
+  border:1px solid var(--line);
+  border-radius:24px;
+  overflow:hidden;
+  background:linear-gradient(180deg,#090e1a55,#06091299);
+  box-shadow:inset 0 1px #fff1
 }
 .hud{
-  position:absolute;top:14px;left:0;right:0;text-align:center;
-  pointer-events:none
-}
-.eyebrow{
-  font-size:10px;letter-spacing:1px;color:var(--muted);
-  display:flex;gap:7px;justify-content:center;align-items:center
-}
-.dot{
-  display:inline-block;background:var(--cyan);width:5px;height:5px;
-  border-radius:50%;box-shadow:0 0 10px var(--cyan)
+  position:absolute;
+  z-index:3;
+  top:24px;
+  left:12px;
+  right:12px;
+  text-align:center
 }
 .multiplier{
-  direction:ltr;font:800 clamp(54px,9vw,104px)/1.12 Tahoma,Arial;
-  letter-spacing:-3px;margin:8px 0;color:#effaff;
-  text-shadow:0 0 45px #64e7ff42;font-variant-numeric:tabular-nums;
-  transition:color .25s
+  direction:ltr;
+  font:bold clamp(58px,16vw,88px)/1 Arial;
+  letter-spacing:-4px;
+  text-shadow:0 0 38px #65e7ff55;
+  font-variant-numeric:tabular-nums
 }
-.multiplier.crashed{color:var(--red);text-shadow:0 0 55px #ff496933}
-.multiplier.countdown{color:var(--orange)}
+.multiplier.lost{
+  color:var(--red);
+  text-shadow:0 0 40px #ff5e7d55
+}
 #status{
-  font-size:12px;color:#c8d5eb;line-height:1.8;
-  min-height:22px;padding:0 8px
+  margin-top:9px;
+  color:#a8b7ce;
+  font-size:11px
 }
-.cash-banner{
-  display:none;margin:12px auto 0;width:fit-content;max-width:90%;
-  border:1px solid #73ffc54a;border-radius:12px;background:#0a2928cc;
-  padding:9px 16px;color:var(--green);font-size:12px;
-  box-shadow:0 0 24px #73ffc515;overflow-wrap:anywhere
+.rocket{
+  position:absolute;
+  z-index:2;
+  left:50%;
+  top:62%;
+  width:58px;
+  height:95px;
+  transform:translate(-50%,-50%);
+  transition:filter .2s
 }
-.cash-banner.show{display:block;animation:arrive .4s ease-out}
-.cash-banner b{direction:ltr;display:inline-block}
-@keyframes arrive{
-  from{opacity:0;transform:translateY(10px) scale(.95)}
-  to{opacity:1;transform:none}
+.rocket-body{
+  position:absolute;
+  inset:0 12px 19px;
+  border-radius:50% 50% 24% 24%;
+  transform:perspective(90px) rotateX(-7deg);
+  background:linear-gradient(90deg,#53627b,#f1f7ff 45%,#667892);
+  clip-path:polygon(50% 0,88% 35%,100% 85%,70% 100%,30% 100%,0 85%,12% 35%)
 }
-.telemetry{
-  position:absolute;bottom:62px;right:6px;font-size:10px;
-  line-height:2.1;color:#9cafcc;pointer-events:none
+.window{
+  position:absolute;
+  z-index:2;
+  top:25px;
+  left:20px;
+  width:18px;
+  height:22px;
+  border:3px solid #15213a;
+  border-radius:50%;
+  background:linear-gradient(145deg,#bffcff,#3686dc 55%,#122a55)
 }
-.telemetry strong{
-  display:block;color:#e9efff;font-size:12px;font-weight:normal
+.wing{
+  position:absolute;
+  top:49px;
+  width:20px;
+  height:38px;
+  background:#263853;
+  border:1px solid #61dfff88
 }
-.telemetry small{color:var(--cyan);font-size:9px;letter-spacing:1px}
-.axis{
-  position:absolute;bottom:68px;left:8px;color:#7f96b2;
-  font:9px monospace;letter-spacing:2px;line-height:2.3;pointer-events:none
+.wing.left{
+  left:2px;
+  clip-path:polygon(100% 0,100% 100%,0 88%,25% 35%)
 }
-.axis i{
-  display:block;width:58px;height:2px;
-  background:linear-gradient(90deg,var(--cyan),transparent);margin-top:7px
+.wing.right{
+  right:2px;
+  clip-path:polygon(0 0,0 100%,100% 88%,75% 35%)
 }
-.history-wrap{
-  position:absolute;bottom:0;left:0;right:0;display:flex;
-  gap:12px;align-items:center;min-height:34px
+.flame{
+  position:absolute;
+  left:22px;
+  top:72px;
+  width:14px;
+  height:0;
+  border-radius:50%;
+  background:linear-gradient(#fff,#57dfff 35%,#ff925a 68%,transparent);
+  filter:drop-shadow(0 0 9px #55dfff);
+  transition:height .25s
 }
-.history-label{font-size:10px;color:var(--muted);white-space:nowrap}
-.history{
-  display:flex;gap:7px;overflow-x:auto;scrollbar-width:none;
-  min-width:0;padding:3px 0
+.rocket.ignite .flame{height:35px}
+.rocket.flying{
+  animation:fly 1.2s ease-in-out infinite alternate
 }
-.history::-webkit-scrollbar{display:none}
-.empty-history{
-  font-size:11px;color:#8293af;padding:7px 0;white-space:nowrap
+.rocket.flying .flame{
+  height:59px;
+  animation:flame .1s linear infinite alternate
 }
-.history-chip{
-  direction:ltr;border:1px solid #ff647e35;background:#291324aa;
-  color:#ff91a6;border-radius:8px;white-space:nowrap;
-  padding:6px 9px;font-size:11px;font-variant-numeric:tabular-nums
+.rocket.boom{
+  opacity:0;
+  filter:drop-shadow(0 0 45px var(--red));
+  transform:translate(-50%,-50%) scale(2.5)
 }
-.history-chip.mid{border-color:#64e7ff36;background:#102838b3;color:#83eaff}
-.history-chip.high{border-color:#a58aff50;background:#281b40bb;color:#ceb8ff}
-.history-chip.epic{border-color:#ffc66a55;background:#322615bb;color:#ffd594}
-.history-chip.win{box-shadow:inset 0 -2px #73ffc5}
-.cockpit{
-  flex-shrink:0;display:grid;grid-template-columns:1fr 1.25fr .85fr;
-  gap:18px;align-items:center;
-  background:linear-gradient(120deg,rgba(18,29,52,.91),rgba(11,16,32,.91));
-  border:1px solid #a5bcf82b;border-radius:22px;padding:17px 20px;
-  box-shadow:0 12px 60px #0005,inset 0 1px #ffffff09;
-  backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px)
+.orbit{
+  position:absolute;
+  left:-20%;
+  bottom:-170px;
+  width:140%;
+  height:300px;
+  border:1px solid #65ddff25;
+  border-radius:50%;
+  transform:rotate(-10deg)
 }
-.field-head{
-  display:flex;justify-content:space-between;align-items:center;
-  color:var(--muted);font-size:10px;margin-bottom:8px
+.players-box{
+  position:absolute;
+  z-index:4;
+  left:10px;
+  right:10px;
+  bottom:10px
 }
-.field-head span{color:var(--cyan);font-size:9px}
-.input-shell{
-  display:flex;align-items:center;border:1px solid #a2bcf52b;
-  background:#060e20bb;border-radius:10px;padding:8px 11px;gap:7px
+.players-head{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  margin:0 5px 7px;
+  color:var(--muted);
+  font-size:10px
 }
-.input-shell:focus-within{border-color:#64e7ff88}
-.input-shell svg{color:#69809f;width:17px;height:17px}
-.input-shell input{
-  direction:ltr;min-width:0;width:100%;color:white;background:none;
-  border:0;outline:none;font-size:17px;letter-spacing:.5px;
-  text-align:left;font-variant-numeric:tabular-nums
+.players{
+  display:flex;
+  gap:7px;
+  overflow-x:auto;
+  scrollbar-width:none;
+  direction:rtl;
+  min-height:58px
 }
-.input-shell input:disabled{opacity:.6}
-.input-shell input[aria-invalid=true]{color:var(--red)}
-.quick{display:flex;gap:6px;margin-top:8px;direction:ltr}
-.quick button{
-  flex:1;border:1px solid var(--line);background:#ffffff04;
-  border-radius:6px;padding:5px 3px;color:#afc0da;font:10px Arial
+.players::-webkit-scrollbar{display:none}
+.player{
+  min-width:155px;
+  max-width:180px;
+  display:flex;
+  align-items:center;
+  gap:8px;
+  padding:8px;
+  border:1px solid var(--line);
+  border-radius:15px;
+  background:#0b1426d9;
+  backdrop-filter:blur(12px)
 }
-.quick button:hover{border-color:var(--cyan);color:var(--cyan)}
-.quick button:disabled{opacity:.35}
+.player.cashed{
+  border-color:#69ffc044;
+  background:#09241fd9
+}
+.player-info{
+  min-width:0;
+  flex:1
+}
+.player strong,.player small{
+  display:block;
+  overflow:hidden;
+  white-space:nowrap;
+  text-overflow:ellipsis
+}
+.player strong{
+  font-size:10px;
+  font-weight:normal
+}
+.player small{
+  direction:ltr;
+  text-align:right;
+  margin-top:5px;
+  color:#8fa5c4;
+  font-size:9px
+}
+.player.cashed small{color:var(--green)}
+.player i{
+  color:var(--green);
+  font-style:normal
+}
+.controls{
+  display:grid;
+  grid-template-columns:.85fr 1.3fr;
+  gap:10px;
+  padding:12px;
+  border:1px solid var(--line);
+  border-radius:20px;
+  background:var(--panel);
+  box-shadow:0 18px 60px #0007;
+  backdrop-filter:blur(18px)
+}
+.stake{
+  display:flex;
+  flex-direction:column;
+  gap:6px;
+  min-width:0
+}
+.stake label{
+  padding-right:4px;
+  color:var(--muted);
+  font-size:9px
+}
+.stake input{
+  direction:ltr;
+  width:100%;
+  height:52px;
+  border:1px solid var(--line);
+  border-radius:13px;
+  outline:0;
+  padding:0 12px;
+  background:#050a16;
+  color:white;
+  font-size:16px;
+  text-align:center
+}
+.stake input:focus{border-color:#63e7ff88}
+.stake.locked{opacity:.42}
 .action{
-  position:relative;min-height:67px;border:1px solid #99eeff66;
-  border-radius:14px;background:linear-gradient(115deg,#76e9ff,#439cf5);
-  box-shadow:0 0 28px #2eaff128,inset 0 1px #fff6;color:#061524;
-  font-weight:700;display:flex;align-items:center;justify-content:center;
-  gap:10px;padding:12px;
-  transition:transform .12s,box-shadow .25s,background .25s;overflow:hidden
+  min-width:0;
+  min-height:76px;
+  border:0;
+  border-radius:15px;
+  cursor:pointer;
+  padding:10px;
+  color:#05121d;
+  font-weight:bold;
+  font-size:14px;
+  background:linear-gradient(120deg,var(--cyan),var(--blue));
+  box-shadow:0 0 28px #42bfff2c;
+  transition:transform .12s,filter .2s
 }
-.action:before{
-  content:"";position:absolute;inset:0;
-  background:linear-gradient(110deg,transparent 15%,#ffffff2b 45%,transparent 70%);
-  transform:translateX(-130%);animation:sheen 5s ease-in-out infinite;
-  pointer-events:none
+.action:active:not(:disabled){transform:scale(.97)}
+.action.join{
+  background:linear-gradient(120deg,#a899ff,#6b73ff)
 }
-.action svg{width:25px;height:25px;flex-shrink:0}
-.action span{display:block;font-size:14px;line-height:1.6}
-.action small{display:block;font-size:10px;font-weight:normal;opacity:.8}
-.action:active:not(:disabled){transform:scale(.974)}
+.action.launch{
+  background:linear-gradient(120deg,#ffd86a,#ff8f52)
+}
 .action.cash{
-  background:linear-gradient(115deg,#8cffe0,#47dac5);
-  border-color:#abffe5aa;box-shadow:0 0 35px #39edbd26
+  background:linear-gradient(120deg,#83ffce,#2fd6b4)
 }
-.action.wait{
-  background:linear-gradient(115deg,#26354d,#1e2940);
-  color:#acbdd6;border-color:var(--line);box-shadow:none
+.action.done{
+  color:var(--green);
+  background:#12372f
 }
-.action.won{
-  background:#113d35;color:var(--green);border-color:#73ffc533;box-shadow:none
+.action.crashed{
+  color:#ff9cad;
+  background:#391725
 }
-.action.lost{
-  background:#351725;color:#ffa3b3;border-color:#ff647e33;box-shadow:none
+.action.disabled{
+  color:#8998b0;
+  background:#1b2639
 }
-.action:disabled:before{animation:none}
-@keyframes sheen{
-  0%,75%{transform:translateX(-130%)}
-  100%{transform:translateX(130%)}
-}
-.payout{
-  text-align:center;border-right:1px solid var(--line);
-  padding-right:10px;min-width:0
-}
-.payout label{
-  display:block;color:var(--muted);font-size:10px;margin-bottom:8px
-}
-.payout strong{
-  font-size:20px;display:block;color:var(--green);
-  overflow-wrap:anywhere;font-variant-numeric:tabular-nums;direction:ltr
-}
-.payout small{display:block;color:#8195b4;font-size:9px;margin-top:8px}
-.footer-note{
-  font-size:9px;color:#8394b0;display:flex;justify-content:space-between;
-  gap:8px;flex-shrink:0;padding:0 4px
-}
-.footer-note span:last-child{direction:ltr;font:9px monospace;letter-spacing:1px}
-#save-warning{color:var(--orange)}
+.action:disabled{cursor:default}
 .toast{
-  position:fixed;z-index:20;bottom:190px;left:50%;
-  transform:translate(-50%,15px);opacity:0;pointer-events:none;
-  background:#18243bf5;border:1px solid #a8c1f544;border-radius:12px;
-  padding:12px 17px;font-size:12px;width:max-content;max-width:90vw;
-  text-align:center;line-height:1.8;transition:opacity .2s,transform .2s
+  position:fixed;
+  z-index:20;
+  left:50%;
+  bottom:115px;
+  width:max-content;
+  max-width:88vw;
+  padding:11px 16px;
+  border:1px solid var(--line);
+  border-radius:13px;
+  background:#172238f2;
+  font-size:11px;
+  opacity:0;
+  pointer-events:none;
+  transform:translate(-50%,12px);
+  transition:.2s
 }
-.toast.show{opacity:1;transform:translate(-50%,0)}
-dialog{
-  color:var(--text);background:#0e182a;border:1px solid #8ca9e63b;
-  border-radius:21px;padding:22px;max-width:min(92vw,560px);
-  width:560px;max-height:85dvh;box-shadow:0 30px 100px #0009
+.toast.show{
+  opacity:1;
+  transform:translate(-50%,0)
 }
-dialog::backdrop{background:#01030bba;backdrop-filter:blur(5px)}
-.modal-head{
-  display:flex;justify-content:space-between;align-items:center;margin-bottom:18px
+@keyframes fly{
+  from{transform:translate(-50%,-50%) rotate(-2deg)}
+  to{transform:translate(-50%,-57%) rotate(2deg)}
 }
-.modal-head h2{font-size:18px;margin:0}
-.modal-body{font-size:13px;line-height:2;color:#bac9df}
-.stat-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-.stat{
-  padding:14px;border:1px solid var(--line);border-radius:13px;
-  background:#060d1d60;min-width:0
+@keyframes flame{
+  from{transform:scaleX(.8)}
+  to{transform:scaleX(1.22)}
 }
-.stat label{color:#94a8c8;font-size:11px;display:block;margin-bottom:8px}
-.stat strong{
-  color:var(--cyan);font-size:20px;display:block;
-  overflow-wrap:anywhere;direction:ltr;text-align:right
-}
-.stat:nth-child(2) strong{color:var(--green)}
-.stat:nth-child(3) strong{color:var(--red)}
-.modal-actions{display:flex;gap:10px;margin-top:18px}
-.modal-actions button{
-  flex:1;padding:12px;border:1px solid var(--line);
-  border-radius:10px;background:#17263e
-}
-.modal-actions .danger{background:#4b1c2c;border-color:#ff647e55}
-.modal-body p{margin:8px 0}
-.modal-body code{direction:ltr;display:inline-block;color:var(--cyan)}
-.sr-only{
-  position:absolute;width:1px;height:1px;padding:0;margin:-1px;
-  overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0
-}
-@media(min-width:1100px){
-  .app{padding-left:40px;padding-right:40px}
-  .hud{top:24px}.topbar{min-height:52px}
-  .cockpit{margin:0 60px}.history-wrap{padding:0 8px}
-}
-@media(max-width:620px){
-  .app{
-    gap:9px;padding-left:12px;padding-right:12px;
-    padding-top:max(10px,env(safe-area-inset-top))
-  }
-  .topbar{gap:7px;min-height:38px}
-  .brand{gap:0}.brand-symbol{display:none}
-  .brand strong{font-size:14px;letter-spacing:.6px}
-  .brand small{font-size:7px;letter-spacing:2px}
-  .balance{gap:5px;padding:5px 7px;font-size:8px}
-  .balance b{font-size:27px}
-  .tools{gap:5px}
-  .icon-btn{width:30px;height:30px;border-radius:9px}
-  .icon-btn svg{width:16px;height:16px}
-  .cockpit{
-    grid-template-columns:1fr 1.16fr;gap:10px;padding:12px;border-radius:18px
-  }
-  .action{min-height:77px;padding:10px;gap:6px}
-  .action svg{width:21px;height:21px}
-  .action span{font-size:12px}.action small{font-size:9px}
-  .payout{
-    grid-column:1/-1;display:flex;justify-content:space-between;
-    align-items:center;gap:8px;border:0;
-    border-top:1px solid var(--line);padding:9px 0 0
-  }
-  .payout label{margin:0;font-size:9px}
-  .payout strong{font-size:14px}.payout small{display:none}
-  .input-shell{padding:6px 9px}.input-shell input{font-size:15px}
-  .field-head{margin-bottom:6px;font-size:9px}
-  .quick{gap:4px;margin-top:6px}
-  .quick button{font-size:9px;padding:4px 1px}
+@media(max-height:650px){
+  .app{gap:7px;padding-top:7px}
+  .top{min-height:34px}
+  .stage{min-height:190px}
   .hud{top:12px}
-  .multiplier{font-size:clamp(55px,17vw,80px)}
-  #status{font-size:10px}
-  .history-label{font-size:8px}
-  .history-wrap{gap:8px}
-  .history-chip{font-size:10px;padding:5px 7px}
-  .telemetry{bottom:58px;font-size:9px}
-  .telemetry strong{font-size:11px}.axis{font-size:8px}
-  .footer-note{font-size:8px}.footer-note span:last-child{font-size:7px}
-  .toast{bottom:205px}
-  .cash-banner{font-size:10px;margin-top:8px;padding:7px 11px}
-}
-@media(max-height:560px){
-  .app{gap:5px;padding-top:5px;padding-bottom:5px}
-  .topbar{min-height:30px}
-  .cockpit{padding:9px 12px;grid-template-columns:1fr 1fr .7fr}
-  .payout{grid-column:auto;display:block;border-top:0;padding:0}
-  .payout strong{font-size:13px}
-  .payout label{margin-bottom:5px}.quick{margin-top:4px}
-  .hud{top:2px}.multiplier{font-size:44px;margin:3px 0}
-  .eyebrow{font-size:8px}.action{min-height:59px}
-  .footer-note,.telemetry,.axis{display:none}
-  .cash-banner{position:absolute;top:0;left:10px;max-width:30%;margin:0}
-  .arena{min-height:120px}
+  .multiplier{font-size:52px}
+  .rocket{top:57%;transform:translate(-50%,-50%) scale(.8)}
+  .players-box{bottom:6px}
+  .controls{padding:9px}
+  .action{min-height:62px}
+  .stake input{height:43px}
 }
 @media(prefers-reduced-motion:reduce){
-  *,*:before{
-    animation:none!important;scroll-behavior:auto!important;
-    transition:none!important
-  }
-  .cockpit{backdrop-filter:none}
+  *{animation:none!important;transition:none!important}
 }
 </style>
 </head>
+
 <body>
-<svg aria-hidden="true" style="position:absolute;width:0;height:0;overflow:hidden">
-<defs>
-<symbol id="i-rocket" viewBox="0 0 24 24">
-  <path d="M14 5c3-3 6-3 6-3s0 3-3 6l-6 6-5-5z"/>
-  <path d="m7 8-4 1-1 5 5-1m4 0-1 5 5-1 1-4M5 16l-3 6 6-3"/>
-  <circle cx="15" cy="7" r="1.5"/>
-</symbol>
-<symbol id="i-sound" viewBox="0 0 24 24">
-  <path d="m11 4-6 5H2v6h3l6 5zM15 8a6 6 0 0 1 0 8m3-11a10 10 0 0 1 0 14"/>
-</symbol>
-<symbol id="i-muted" viewBox="0 0 24 24">
-  <path d="m11 4-6 5H2v6h3l6 5zM16 9l6 6m0-6-6 6"/>
-</symbol>
-<symbol id="i-chart" viewBox="0 0 24 24">
-  <path d="M4 3v18h17M8 16v-5m5 5V6m5 10V3"/>
-</symbol>
-<symbol id="i-reset" viewBox="0 0 24 24">
-  <path d="M3 9a9 9 0 1 1 1 9M3 3v6h6"/>
-</symbol>
-<symbol id="i-help" viewBox="0 0 24 24">
-  <circle cx="12" cy="12" r="10"/>
-  <path d="M9 8a3 3 0 1 1 4 3c-1 .5-1 1-1 3m0 3h.01"/>
-</symbol>
-<symbol id="i-close" viewBox="0 0 24 24">
-  <path d="m6 6 12 12M18 6 6 18"/>
-</symbol>
-<symbol id="i-credit" viewBox="0 0 24 24">
-  <path d="m12 2 9 5v10l-9 5-9-5V7z"/>
-  <path d="m8 9 4-2 4 2v6l-4 2-4-2z"/>
-</symbol>
-<symbol id="i-check" viewBox="0 0 24 24">
-  <path d="m4 12 5 5L20 6"/>
-</symbol>
-</defs>
-</svg>
-
-<canvas id="space" aria-hidden="true"></canvas>
-
 <main class="app">
-<header class="topbar">
-  <div class="brand">
-    <div class="brand-symbol"><svg><use href="#i-rocket"/></svg></div>
-    <div><strong>ROCKET CRASH</strong><small>INFINITE SPACE</small></div>
-  </div>
-  <div class="balance" aria-label="موجودی بی‌نهایت اعتبار مجازی">
-    <b>∞</b><span>اعتبار<br>مجازی</span>
-  </div>
-  <div class="tools">
-    <button class="icon-btn" id="sound-btn"
-      title="روشن یا خاموش کردن صدا"
-      aria-label="خاموش کردن صدا" aria-pressed="true">
-      <svg><use id="sound-icon" href="#i-sound"/></svg>
+  <header class="top">
+    <div class="logo"><i></i> ROCKET LIVE</div>
+
+    <div class="me">
+      <span id="me-name">...</span>
+      <div class="mini-avatar" id="me-avatar"></div>
+    </div>
+  </header>
+
+  <section class="stage">
+    <div class="hud">
+      <div class="multiplier" id="multiplier">۱٫۰۰×</div>
+      <div id="status">آماده</div>
+    </div>
+
+    <div class="rocket" id="rocket">
+      <div class="wing left"></div>
+      <div class="wing right"></div>
+      <div class="rocket-body"></div>
+      <div class="window"></div>
+      <div class="flame"></div>
+    </div>
+
+    <div class="orbit"></div>
+
+    <div class="players-box">
+      <div class="players-head">
+        <span>بازیکن‌ها</span>
+        <b id="player-count">۰</b>
+      </div>
+      <div class="players" id="players"></div>
+    </div>
+  </section>
+
+  <section class="controls">
+    <div class="stake" id="stake-wrap">
+      <label for="stake">مبلغ</label>
+      <input
+        id="stake"
+        type="text"
+        inputmode="numeric"
+        value="۱۰۰٬۰۰۰"
+        maxlength="14"
+        autocomplete="off">
+    </div>
+
+    <button class="action" id="action" type="button">
+      اتصال…
     </button>
-    <button class="icon-btn" id="stats-btn"
-      title="آمار پروازها" aria-label="نمایش آمار">
-      <svg><use href="#i-chart"/></svg>
-    </button>
-    <button class="icon-btn" id="reset-btn"
-      title="ریست آمار" aria-label="ریست آمار">
-      <svg><use href="#i-reset"/></svg>
-    </button>
-    <button class="icon-btn" id="help-btn"
-      title="راهنمای بازی" aria-label="راهنمای بازی">
-      <svg><use href="#i-help"/></svg>
-    </button>
-  </div>
-</header>
-
-<section class="arena" id="arena" aria-label="صحنه پرواز">
-  <i class="corner a"></i><i class="corner b"></i>
-  <i class="corner c"></i><i class="corner d"></i>
-
-  <div class="hud">
-    <div class="eyebrow">
-      <i class="dot"></i><span id="phase-label">آمادهٔ پرواز</span>
-    </div>
-    <div class="multiplier" id="multiplier">۱٫۰۰×</div>
-    <div id="status">قبل از انفجار، اعتبارت را برداشت کن.</div>
-    <div class="cash-banner" id="cash-banner">
-      برداشت موفق · <b id="cash-value"></b> اعتبار
-    </div>
-  </div>
-
-  <div class="telemetry">
-    <small id="ship-code">MK — 01</small>
-    <strong id="ship-name">سفینه</strong>
-    <span id="telemetry">سامانه‌های پرواز آماده‌اند</span>
-  </div>
-  <div class="axis" dir="ltr">
-    DEEP SPACE<br><span id="sector">SECTOR 01</span><i></i>
-  </div>
-  <div class="history-wrap">
-    <span class="history-label">پروازهای اخیر</span>
-    <div class="history" id="history" aria-label="تاریخچه دورها"></div>
-  </div>
-</section>
-
-<section class="cockpit" aria-label="کنترل پرواز">
-  <div class="stake-field">
-    <label class="field-head" for="stake">
-      مبلغ شرط مجازی <span>موجودی نامحدود</span>
-    </label>
-    <div class="input-shell">
-      <svg><use href="#i-credit"/></svg>
-      <input id="stake" type="text" inputmode="decimal"
-        value="۱۰۰٬۰۰۰" maxlength="130" autocomplete="off"
-        spellcheck="false" aria-describedby="input-help">
-    </div>
-    <span id="input-help" class="sr-only">
-      مبلغ مثبت، با حداکثر دو رقم اعشار وارد کنید.
-    </span>
-    <div class="quick">
-      <button type="button" data-stake="10000">10K</button>
-      <button type="button" data-stake="50000">50K</button>
-      <button type="button" data-stake="100000">100K</button>
-      <button type="button" data-stake="1000000">1M</button>
-    </div>
-  </div>
-
-  <button class="action" id="action" type="button">
-    <svg><use id="action-icon" href="#i-rocket"/></svg>
-    <div>
-      <span id="action-label">شروع پرواز</span>
-      <small id="action-sub">یک موشک؛ یک فرصت</small>
-    </div>
-  </button>
-
-  <div class="payout">
-    <label id="payout-label">ارزش لحظه‌ای پرواز</label>
-    <strong id="payout">۱۰۰٬۰۰۰</strong>
-    <small>اعتبار مجازی</small>
-  </div>
-</section>
-
-<div class="footer-note">
-  <span id="save-warning">فقط سرگرمی · بدون پول واقعی</span>
-  <span id="quality-label">FLIGHT SYSTEM / ONLINE</span>
-</div>
+  </section>
 </main>
 
-<div id="toast" class="toast" role="status"></div>
-<div class="sr-only" id="announce" role="status" aria-live="polite"></div>
-
-<dialog id="stats-dialog">
-  <div class="modal-head">
-    <h2>کارنامهٔ پرواز</h2>
-    <button class="icon-btn" data-close aria-label="بستن">
-      <svg><use href="#i-close"/></svg>
-    </button>
-  </div>
-  <div class="stat-grid">
-    <div class="stat"><label>کل دورها</label><strong id="stat-rounds">۰</strong></div>
-    <div class="stat"><label>برداشت‌های موفق</label><strong id="stat-wins">۰</strong></div>
-    <div class="stat"><label>باخت‌ها</label><strong id="stat-losses">۰</strong></div>
-    <div class="stat"><label>بیشترین ضریب برداشت</label><strong id="stat-best">—</strong></div>
-    <div class="stat"><label>مجموع اعتبار برداشت‌شده</label><strong id="stat-won">۰</strong></div>
-    <div class="stat"><label>مجموع اعتبار باخته‌شده</label><strong id="stat-lost">۰</strong></div>
-  </div>
-  <p class="modal-body">
-    برداشت همان لحظه ثبت می‌شود؛ انفجار بعدی آن را تغییر نمی‌دهد.
-  </p>
-</dialog>
-
-<dialog id="reset-dialog">
-  <div class="modal-head"><h2>پاک کردن آمار</h2></div>
-  <div class="modal-body">تاریخچه و آمار ذخیره‌شدهٔ این مرورگر پاک شود؟</div>
-  <div class="modal-actions">
-    <button data-close>انصراف</button>
-    <button class="danger" id="confirm-reset">پاک کردن آمار</button>
-  </div>
-</dialog>
-
-<dialog id="help-dialog">
-  <div class="modal-head">
-    <h2>راهنمای مأموریت</h2>
-    <button class="icon-btn" data-close aria-label="بستن">
-      <svg><use href="#i-close"/></svg>
-    </button>
-  </div>
-  <div class="modal-body">
-    <p>
-      مبلغی مثبت وارد کن، پرواز را آغاز کن و قبل از انفجار همان دکمه را
-      برای برداشت بزن. هر دور فقط یک برداشت دارد. موشک پس از برداشت
-      هم به پرواز ادامه می‌دهد.
-    </p>
-    <p>
-      موجودی همیشه ∞ است. همهٔ مبلغ‌ها اعتبار مجازی‌اند و هیچ پرداخت
-      یا برداشت مالی وجود ندارد.
-    </p>
-    <p>
-      ضریب پایان هر دور مستقل است؛ حتی انفجار در ۱٫۰۰× ممکن است.
-      از روی دورهای گذشته نمی‌توان پایان دور بعد را پیش‌بینی کرد.
-    </p>
-    <p>
-      توزیع پایان پرواز: پارتو با پارامتر ۱٫۱۵ و سقف ۱۰۰×.
-      نمونهٔ تصادفی از <code>crypto.getRandomValues</code> گرفته می‌شود
-      و فرمول آن <code>min(100, (1-u)^(-1/1.15))</code> است؛
-      نتیجه تا دو رقم اعشار پایین گرد می‌شود.
-      پارامترها در <code>SETTINGS</code> قابل تنظیم‌اند.
-    </p>
-    <p>
-      مبلغ برداشت با ضریب دو رقمیِ لحظهٔ کلیک محاسبه می‌شود و تا
-      صدم اعتبار پایین گرد می‌شود. مبلغ‌های بزرگ بدون تبدیل به
-      عدد اعشاری ذخیره می‌شوند.
-    </p>
-    <p>
-      خروج از تب زمان را متوقف نمی‌کند. بستن یا تازه‌سازی صفحه،
-      دور باز را خاتمه می‌دهد؛ برداشت ثبت‌شده محفوظ می‌ماند.
-      ذخیره‌سازی به پشتیبانی مرورگر از localStorage وابسته است.
-    </p>
-    <p>
-      دسکتاپ: کلید Space برای شروع یا برداشت و کلید M برای صدا.
-      با تنظیم کاهش حرکت دستگاه، جلوه‌ها آرام‌تر می‌شوند.
-    </p>
-  </div>
-</dialog>
-
-<noscript>برای اجرای این بازی JavaScript مرورگر را فعال کنید.</noscript>
-
-<script>
-'use strict';
-
-(()=>{
-  /* All financial-looking values are fictional game credits.
-     Credit arithmetic uses integer hundredths and BigInt. */
-  const SETTINGS = Object.freeze({
-    countdownMs: 2400,
-    crashFxMs: 1500,
-    roundEndMs: 1700,
-    growth: .065,
-    acceleration: .0012,
-    shape: 1.15,
-    maxCrashCents: 10000,
-    historyLimit: 18
-  });
-
-  const PERSIAN = '۰۱۲۳۴۵۶۷۸۹';
-  const ARABIC = '٠١٢٣٤٥٦٧٨٩';
-
-  function parseStake(value) {
-    const s = String(value).trim()
-      .replace(/[۰-۹]/g, c => PERSIAN.indexOf(c))
-      .replace(/[٠-٩]/g, c => ARABIC.indexOf(c))
-      .replace(/[٬,\s]/g, '')
-      .replace(/٫/g, '.');
-
-    if (s.length > 100 || !/^\d+(?:\.\d{1,2})?$/.test(s)) return null;
-
-    const [whole, fraction = ''] = s.split('.');
-    const result = BigInt(whole) * 100n +
-      BigInt(fraction.padEnd(2, '0'));
-
-    return result > 0n ? result : null;
-  }
-
-  function emptyData() {
-    return {
-      version: 1,
-      stats: {
-        rounds: 0, wins: 0, losses: 0,
-        won: '0', lost: '0', best: 0
-      },
-      history: [],
-      active: null
-    };
-  }
-
-  // Capped Pareto distribution, quantized downward to two decimals.
-  function crashFromUniform(u) {
-    if (!(u > 0 && u < 1)) throw new Error('Invalid random sample');
-    return Math.max(100, Math.min(
-      SETTINGS.maxCrashCents,
-      Math.floor(100 * Math.pow(1 - u, -1 / SETTINGS.shape))
-    ));
-  }
-
-  // Analytic inverse of exp(growth*t + acceleration*t*t).
-  function flightDuration(cents) {
-    const log = Math.log(cents / 100);
-    return 2000 * log / (
-      Math.sqrt(SETTINGS.growth ** 2 +
-        4 * SETTINGS.acceleration * log) +
-      SETTINGS.growth
-    );
-  }
-
-  function multiplierAt(ms) {
-    const seconds = Math.max(0, ms) / 1000;
-    return Math.exp(
-      SETTINGS.growth * seconds +
-      SETTINGS.acceleration * seconds * seconds
-    );
-  }
-
-  class FlightGame {
-    constructor(random, data = emptyData(), onSave = () => {}) {
-      this.random = random;
-      this.data = data;
-      this.onSave = onSave;
-      this.state = 'READY';
-      this.round = null;
-      this.events = [];
-      this.ship = Math.floor(random() * 8);
-
-      // Reload closes the saved round; a saved cashout remains a win.
-      if (this.data.active) {
-        this.round = this.data.active;
-        this.completeRound();
-        this.round = null;
-        this.persist();
-        this.events.push({type: 'recovered', at: 0});
-      }
-    }
-
-    persist() {
-      this.onSave(this.data);
-    }
-
-    emit(type, at) {
-      this.events.push({type, at});
-    }
-
-    start(stake, now) {
-      if (
-        this.state !== 'READY' ||
-        typeof stake !== 'bigint' ||
-        stake <= 0n
-      ) return false;
-
-      const crash = crashFromUniform(this.random());
-
-      this.round = {
-        stake: String(stake),
-        crash,
-        cash: null,
-        recorded: false,
-        model: this.ship,
-        startsAt: now + SETTINGS.countdownMs,
-        crashAt: now + SETTINGS.countdownMs + flightDuration(crash)
-      };
-
-      this.data.active = this.round;
-      this.state = 'COUNTDOWN';
-      this.persist();
-      this.emit('countdown', now);
-      return true;
-    }
-
-    cents(now) {
-      if (!this.round) return 100;
-      if (this.state === 'COUNTDOWN') return 100;
-
-      if (this.state === 'CRASHED' || this.state === 'ROUND_END') {
-        return this.round.crash;
-      }
-
-      return Math.min(
-        this.round.crash,
-        Math.floor(
-          multiplierAt(now - this.round.startsAt) * 100 + 1e-9
-        )
-      );
-    }
-
-    // One call can catch up every transition after a hidden tab resumes.
-    advance(now) {
-      if (!this.round) return;
-
-      if (
-        this.state === 'COUNTDOWN' &&
-        now >= this.round.startsAt
-      ) {
-        this.state = 'FLYING';
-        this.emit('launch', this.round.startsAt);
-      }
-
-      if (
-        this.state === 'FLYING' &&
-        now >= this.round.crashAt
-      ) {
-        this.completeRound();
-        this.state = 'CRASHED';
-        this.persist();
-        this.emit('crash', this.round.crashAt);
-      }
-
-      if (
-        this.state === 'CRASHED' &&
-        now >= this.round.crashAt + SETTINGS.crashFxMs
-      ) {
-        this.state = 'ROUND_END';
-        this.emit('end', this.round.crashAt + SETTINGS.crashFxMs);
-      }
-
-      if (
-        this.state === 'ROUND_END' &&
-        now >= this.round.crashAt +
-          SETTINGS.crashFxMs + SETTINGS.roundEndMs
-      ) {
-        // Uniform choice among the seven different models.
-        this.ship = (
-          this.ship + 1 + Math.floor(this.random() * 7)
-        ) % 8;
-
-        this.state = 'READY';
-        this.round = null;
-        this.emit('ready', now);
-      }
-    }
-
-    cashOut(now) {
-      // At the deadline, the crash takes precedence over cashout.
-      this.advance(now);
-
-      if (
-        this.state !== 'FLYING' ||
-        this.round.cash
-      ) return null;
-
-      const cents = this.cents(now);
-      const prize = (
-        BigInt(this.round.stake) * BigInt(cents) / 100n
-      ).toString();
-
-      this.round.cash = {cents, prize};
-      this.recordOutcome();
-      this.persist();
-      this.emit('cash', now);
-
-      return this.round.cash;
-    }
-
-    recordOutcome() {
-      if (this.round.recorded) return;
-
-      const r = this.round;
-      const s = this.data.stats;
-      s.rounds++;
-
-      if (r.cash) {
-        s.wins++;
-        s.won = String(BigInt(s.won) + BigInt(r.cash.prize));
-        s.best = Math.max(s.best, r.cash.cents);
-      } else {
-        s.losses++;
-        s.lost = String(BigInt(s.lost) + BigInt(r.stake));
-      }
-
-      r.recorded = true;
-    }
-
-    completeRound() {
-      this.recordOutcome();
-      const r = this.round;
-
-      this.data.history.unshift({
-        crash: r.crash,
-        cash: r.cash ? {...r.cash} : null,
-        stake: r.stake,
-        model: r.model
-      });
-
-      this.data.history.length = Math.min(
-        this.data.history.length,
-        SETTINGS.historyLimit
-      );
-
-      this.data.active = null;
-    }
-
-    reset() {
-      if (this.state !== 'READY') return false;
-      this.data = emptyData();
-      this.persist();
-      return true;
-    }
-  }
-
-  /* Each ship has its own silhouette, wings, cockpit and engine layout.
-     Coordinates are local to the craft, with its nose pointing upward. */
-  const SHIPS = [
-    {
-      name:'پیشگام — کلاسیک',
-      code:'VANGUARD / MK–01',
-      color:'#63dcff',flame:'#ffb35a',
-      body:[[0,-48],[13,-23],[13,30],[-13,30],[-13,-23]],
-      wings:[
-        [[-12,0],[-29,31],[-26,43],[-12,28]],
-        [[12,0],[29,31],[26,43],[12,28]]
-      ],
-      engines:[[0,31,8]],
-      windows:[[0,-10,7,10]]
-    },
-    {
-      name:'شبح — جنگندهٔ آینده',
-      code:'ECLIPSE / MK–02',
-      color:'#9da9ff',flame:'#7abaff',
-      body:[[0,-51],[10,-13],[17,31],[0,23],[-17,31],[-10,-13]],
-      wings:[
-        [[-7,-13],[-43,27],[-40,37],[-9,18]],
-        [[7,-13],[43,27],[40,37],[9,18]]
-      ],
-      engines:[[-10,29,6],[10,29,6]],
-      windows:[[0,-15,4,12]]
-    },
-    {
-      name:'نوا — بشقاب نئونی',
-      code:'NOVA / MK–03',
-      color:'#c284ff',flame:'#d898ff',
-      saucer:true,body:[],wings:[],
-      engines:[[-18,16,5],[0,21,7],[18,16,5]],
-      windows:[]
-    },
-    {
-      name:'آئوروس — طلایی',
-      code:'AUREUS / MK–04',
-      color:'#ffdc83',flame:'#ffe2a0',gold:true,
-      body:[[0,-53],[12,-20],[10,27],[0,37],[-10,27],[-12,-20]],
-      wings:[
-        [[-9,-13],[-30,6],[-22,36],[-15,19]],
-        [[9,-13],[30,6],[22,36],[15,19]]
-      ],
-      engines:[[-7,29,5],[7,29,5]],
-      windows:[[0,-11,5,9]]
-    },
-    {
-      name:'کومت — شاتل کوچک',
-      code:'COMET / MK–05',
-      color:'#86ffd2',flame:'#6dffdb',
-      body:[
-        [0,-31],[15,-20],[18,8],[11,25],
-        [-11,25],[-18,8],[-15,-20]
-      ],
-      wings:[
-        [[-14,-12],[-26,-5],[-26,22],[-15,29]],
-        [[14,-12],[26,-5],[26,22],[15,29]]
-      ],
-      engines:[[0,24,10]],
-      windows:[[0,-9,10,9]]
-    },
-    {
-      name:'وایپر — مسابقه‌ای',
-      code:'VIPER / MK–06',
-      color:'#ff6b85',flame:'#ff7760',
-      body:[[0,-55],[8,-25],[11,23],[0,33],[-11,23],[-8,-25]],
-      wings:[
-        [[-7,-18],[-32,30],[-17,23],[-10,8]],
-        [[7,-18],[32,30],[17,23],[10,8]],
-        [[-4,12],[-15,43],[-3,33]],
-        [[4,12],[15,43],[3,33]]
-      ],
-      engines:[[-5,31,4],[5,31,4]],
-      windows:[[0,-14,3,12]]
-    },
-    {
-      name:'آیون — پیشرانهٔ آبی',
-      code:'ION / MK–07',
-      color:'#49bfff',flame:'#6fedff',
-      body:[
-        [0,-43],[16,-16],[16,12],[7,28],
-        [-7,28],[-16,12],[-16,-16]
-      ],
-      wings:[
-        [[-20,-30],[-32,-10],[-32,25],[-22,31],[-25,-5]],
-        [[20,-30],[32,-10],[32,25],[22,31],[25,-5]]
-      ],
-      engines:[[-27,27,5],[-7,26,4],[7,26,4],[27,27,5]],
-      windows:[[0,-10,8,6]]
-    },
-    {
-      name:'تایتان — سه موتور',
-      code:'TITAN / MK–08',
-      color:'#ffc08d',flame:'#ff9957',
-      body:[[0,-49],[14,-29],[17,30],[-17,30],[-14,-29]],
-      wings:[
-        [[-22,-24],[-29,-9],[-29,36],[-17,36],[-17,-9]],
-        [[22,-24],[29,-9],[29,36],[17,36],[17,-9]],
-        [[-27,8],[-40,36],[-28,30]],
-        [[27,8],[40,36],[28,30]]
-      ],
-      engines:[[-23,36,6],[0,32,9],[23,36,6]],
-      windows:[[0,-16,7,10]]
-    }
-  ];
-
-  const wrap = (n,m) => ((n % m) + m) % m;
-  const lerp = (a,b,t) => a + (b-a)*t;
-
-  function polygon(c, points, fill, stroke) {
-    if (!points.length) return;
-    c.beginPath();
-    c.moveTo(points[0][0],points[0][1]);
-
-    for (let i=1;i<points.length;i++) {
-      c.lineTo(points[i][0],points[i][1]);
-    }
-
-    c.closePath();
-
-    if(fill){
-      c.fillStyle=fill;
-      c.fill();
-    }
-
-    if(stroke){
-      c.strokeStyle=stroke;
-      c.lineWidth=1;
-      c.stroke();
-    }
-  }
-
-  function texture(size, draw) {
-    const canvas=document.createElement('canvas');
-    canvas.width=canvas.height=size;
-    draw(canvas.getContext('2d'),size);
-    return canvas;
-  }
-
-  class SpaceScene {
-    constructor(canvas, arena) {
-      this.canvas=canvas;
-      this.c=canvas.getContext('2d');
-      this.arena=arena;
-
-      this.reduced=matchMedia(
-        '(prefers-reduced-motion: reduce)'
-      ).matches;
-
-      this.low=this.reduced ||
-        (navigator.hardwareConcurrency || 8)<=4 ||
-        (navigator.deviceMemory || 8)<=4;
-
-      this.cam={x:0,y:0};
-      this.zoom=1.35;
-      this.angle=0;
-      this.particles=[];
-      this.boom=-1e6;
-      this.success=-1e6;
-      this.launch=-1e6;
-      this.seed=Math.random()*6.28;
-      this.shipPoint={x:0,y:0};
-      this.emission=0;
-
-      // Math.random is used only for decorative graphics and audio.
-      this.stars=Array.from({length:220},()=>({
-        x:Math.random(),
-        y:Math.random(),
-        d:.2+Math.random()*.8,
-        radius:.4+Math.random()*1.25,
-        phase:Math.random()*6.28
-      }));
-
-      this.nebula=texture(512,(c,s)=>{
-        const clouds=[
-          [.3,.4,.46,'86,44,173'],
-          [.65,.6,.36,'35,91,168'],
-          [.6,.2,.31,'117,48,124']
-        ];
-
-        for(const [x,y,r,col] of clouds){
-          const g=c.createRadialGradient(
-            x*s,y*s,0,x*s,y*s,r*s
-          );
-          g.addColorStop(0,'rgba('+col+',.28)');
-          g.addColorStop(.5,'rgba('+col+',.09)');
-          g.addColorStop(1,'rgba('+col+',0)');
-          c.fillStyle=g;
-          c.fillRect(0,0,s,s);
-        }
-      });
-
-      this.planet=texture(320,(c)=>{
-        c.translate(160,160);
-        c.rotate(-.4);
-
-        c.strokeStyle='#7a9cc430';
-        c.lineWidth=15;
-        c.beginPath();
-        c.ellipse(0,0,145,40,0,0,Math.PI*2);
-        c.stroke();
-
-        c.save();
-        c.beginPath();
-        c.arc(0,0,87,0,Math.PI*2);
-        c.clip();
-
-        const g=c.createRadialGradient(
-          -42,-42,2,20,25,130
-        );
-
-        g.addColorStop(0,'#385b85');
-        g.addColorStop(.4,'#1c3154');
-        g.addColorStop(.8,'#091122');
-        g.addColorStop(1,'#040712');
-
-        c.fillStyle=g;
-        c.fillRect(-90,-90,180,180);
-
-        for(let i=0;i<12;i++){
-          c.strokeStyle='rgba(124,160,204,'+
-            (.035+Math.random()*.035)+')';
-          c.lineWidth=3+Math.random()*6;
-          c.beginPath();
-          c.ellipse(0,-90+i*16,110,22,.1,0,Math.PI);
-          c.stroke();
-        }
-
-        c.restore();
-
-        c.strokeStyle='#98beef38';
-        c.lineWidth=8;
-        c.beginPath();
-        c.ellipse(0,0,145,40,0,0,Math.PI);
-        c.stroke();
-      });
-
-      this.resize();
-    }
-
-    resize() {
-      this.w=innerWidth;
-      this.h=innerHeight;
-
-      const dpr=Math.min(
-        devicePixelRatio||1,this.low?1.25:2
-      );
-
-      this.canvas.width=Math.round(this.w*dpr);
-      this.canvas.height=Math.round(this.h*dpr);
-      this.c.setTransform(dpr,0,0,dpr,0,0);
-      this.bounds=this.arena.getBoundingClientRect();
-    }
-
-    burst(kind, now) {
-      const win=kind==='cash';
-
-      if(win)this.success=now;
-      else this.boom=now;
-
-      const count=this.low?
-        (win?24:55):
-        (win?48:110);
-
-      for(let i=0;i<count;i++){
-        const a=Math.random()*Math.PI*2;
-        const speed=(win?60:85)+
-          Math.random()*(win?180:340);
-
-        this.particles.push({
-          x:this.shipPoint.x,
-          y:this.shipPoint.y,
-          vx:Math.cos(a)*speed,
-          vy:Math.sin(a)*speed,
-          life:.6+Math.random()*1.3,
-          max:2,
-          size:1+Math.random()*4,
-          color:win?
-            (i%2?'#80ffd1':'#ffe29c'):
-            (i%3?'#ffab60':'#c8efff'),
-          smoke:false
-        });
-      }
-    }
-
-    ship(c, model, engine, now) {
-      const s=SHIPS[model];
-      const t=now*.001;
-
-      if(engine>0){
-        for(const [x,y,r] of s.engines){
-          const length=(18+engine*55)*
-            (1+Math.sin(t*43+x)*.12);
-
-          const glow=c.createRadialGradient(
-            x,y+10,0,x,y+10,34
-          );
-
-          glow.addColorStop(0,s.flame+'65');
-          glow.addColorStop(1,s.flame+'00');
-          c.fillStyle=glow;
-          c.fillRect(x-34,y-24,68,68);
-
-          c.beginPath();
-          c.moveTo(x-r,y);
-          c.bezierCurveTo(
-            x-r*1.5,y+length*.4,
-            x+Math.sin(t*51)*4,y+length*.7,
-            x,y+length
-          );
-          c.bezierCurveTo(
-            x+r*.7,y+length*.7,
-            x+r*1.5,y+length*.3,
-            x+r,y
-          );
-          c.fillStyle=s.flame;
-          c.fill();
-
-          c.beginPath();
-          c.moveTo(x-r*.5,y);
-          c.quadraticCurveTo(
-            x-3,y+length*.35,x,y+length*.7
-          );
-          c.quadraticCurveTo(
-            x+4,y+length*.3,x+r*.5,y
-          );
-          c.fillStyle='#f3faff';
-          c.fill();
-        }
-      }
-
-      const hull=c.createLinearGradient(-25,0,25,0);
-      hull.addColorStop(0,s.gold?'#80602c':'#354259');
-      hull.addColorStop(.36,s.gold?'#ffe4a3':'#e5edff');
-      hull.addColorStop(.55,s.gold?'#e6b75e':'#9eb4d1');
-      hull.addColorStop(1,s.gold?'#694920':'#26384e');
-
-      for(const wing of s.wings){
-        polygon(c,wing,'#1c2c46',s.color);
-      }
-
-      if(s.saucer){
-        c.fillStyle=hull;
-        c.beginPath();
-        c.ellipse(0,4,43,18,0,0,Math.PI*2);
-        c.fill();
-
-        c.strokeStyle=s.color;
-        c.lineWidth=2;
-        c.beginPath();
-        c.ellipse(0,8,39,10,0,0,Math.PI);
-        c.stroke();
-
-        const glass=c.createLinearGradient(0,-30,0,6);
-        glass.addColorStop(0,'#d6caff');
-        glass.addColorStop(.4,'#8966ce');
-        glass.addColorStop(1,'#231944');
-
-        c.fillStyle=glass;
-        c.beginPath();
-        c.ellipse(0,-5,23,22,0,Math.PI,Math.PI*2);
-        c.lineTo(23,4);
-        c.lineTo(-23,4);
-        c.fill();
-
-        for(let i=-2;i<=2;i++){
-          c.fillStyle=i%2?'#aaf3ff':s.color;
-          c.beginPath();
-          c.arc(i*12,13-Math.abs(i)*2,2,0,Math.PI*2);
-          c.fill();
-        }
-      }else{
-        polygon(c,s.body,hull,'#dcecff66');
-
-        c.strokeStyle=s.color;
-        c.lineWidth=2.5;
-        c.beginPath();
-        c.moveTo(0,3);
-        c.lineTo(0,22);
-        c.stroke();
-
-        for(const [x,y,rx,ry] of s.windows){
-          const glass=c.createLinearGradient(
-            x-rx,y-ry,x+rx,y+ry
-          );
-
-          glass.addColorStop(0,'#c6f6ff');
-          glass.addColorStop(.35,s.color);
-          glass.addColorStop(1,'#112442');
-
-          c.fillStyle=glass;
-          c.strokeStyle='#06101e';
-          c.lineWidth=2;
-          c.beginPath();
-          c.ellipse(x,y,rx,ry,0,0,Math.PI*2);
-          c.fill();
-          c.stroke();
-
-          c.strokeStyle='#ffffff77';
-          c.lineWidth=1;
-          c.beginPath();
-          c.moveTo(x-rx*.4,y-ry*.5);
-          c.lineTo(x+rx*.3,y-ry*.7);
-          c.stroke();
-        }
-
-        c.strokeStyle='#08101e77';
-        c.lineWidth=1;
-        c.beginPath();
-        c.moveTo(-8,19);
-        c.lineTo(8,19);
-        c.stroke();
-      }
-
-      for(const [x,y,r] of s.engines){
-        c.fillStyle='#101725';
-        c.fillRect(x-r,y-3,r*2,5);
-        c.fillStyle=engine>0?s.flame:'#52667e';
-        c.fillRect(x-r*.7,y+1,r*1.4,2);
-      }
-    }
-
-    render(now,dt,game) {
-      const c=this.c,w=this.w,h=this.h,b=this.bounds;
-      const r=game.round;
-      const flying=game.state==='FLYING';
-      const countdown=game.state==='COUNTDOWN';
-
-      const elapsed=r?
-        Math.max(0,Math.min(now,r.crashAt)-r.startsAt)/1000:
-        0;
-
-      const alive=game.state==='READY'||countdown||flying;
-      const speed=flying?Math.min(1,elapsed/22):0;
-
-      const world={
-        x:elapsed*145+50*Math.sin(elapsed*.8),
-        y:-elapsed*145-6*elapsed*elapsed
-      };
-
-      const vx=145+40*Math.cos(elapsed*.8);
-      const vy=-145-12*elapsed;
-
-      const targetZoom=countdown?1.42:
-        flying?
-          1.03-.16*Math.min(1,elapsed/10)+
-          (this.reduced?0:
-            .15*Math.sin(elapsed*.43)+
-            .08*Math.sin(elapsed*.18)):
-          1.25;
-
-      const smooth=1-Math.exp(-dt*3.5);
-      this.zoom=lerp(this.zoom,targetZoom,smooth);
-
-      const anchorX=w*(
-        flying?
-          .46+(this.reduced?0:
-            .055*Math.sin(elapsed*.27+this.seed)):
-          .48
-      );
-
-      const anchorY=b.top+b.height*(flying?.61:.66);
-
-      this.cam.x=lerp(
-        this.cam.x,
-        world.x-(anchorX-w/2)/this.zoom,
-        smooth
-      );
-
-      this.cam.y=lerp(
-        this.cam.y,
-        world.y-(anchorY-h/2)/this.zoom,
-        smooth
-      );
-
-      let x=(world.x-this.cam.x)*this.zoom+w/2;
-      let y=(world.y-this.cam.y)*this.zoom+h/2;
-
-      x=Math.max(48,Math.min(w-48,x));
-      y=Math.max(
-        b.top+b.height*.43,
-        Math.min(b.bottom-62,y)
-      );
-
-      if(!this.reduced)y+=Math.sin(now*.0018)*3;
-
-      this.angle=lerp(
-        this.angle,
-        flying?
-          Math.atan2(vy,vx)+Math.PI/2:
-          Math.sin(now*.0008)*.045,
-        smooth
-      );
-
-      this.shipPoint={x,y};
-
-      const age=(now-this.boom)/1000;
-      const successAge=(now-this.success)/1000;
-
-      c.clearRect(0,0,w,h);
-      c.fillStyle='#050813';
-      c.fillRect(0,0,w,h);
-      c.save();
-
-      const ignition=countdown?
-        Math.max(0,1-(r.startsAt-now)/500):
-        Math.max(0,1-(now-this.launch)/700);
-
-      if(!this.reduced&&ignition>0){
-        c.translate(
-          Math.sin(now*.06)*ignition*3,
-          Math.cos(now*.075)*ignition*2
-        );
-      }
-
-      if(!this.reduced&&age>=0&&age<.7){
-        const shake=(1-age/.7)*8;
-        c.translate(
-          Math.sin(now*.081)*shake,
-          Math.cos(now*.067)*shake*.65
-        );
-      }
-
-      c.save();
-      c.globalAlpha=this.low?.7:1;
-      c.translate(
-        w*.48-this.cam.x*.012,
-        h*.4-this.cam.y*.009
-      );
-      c.rotate(Math.sin(now*.000017)*.14);
-
-      const neb=Math.max(w,h)*1.18;
-      c.drawImage(this.nebula,-neb/2,-neb/2,neb,neb);
-      c.restore();
-
-      const planetSize=Math.min(w*.58,360);
-      c.globalAlpha=.65;
-      c.drawImage(
-        this.planet,
-        w*.02-this.cam.x*.015,
-        h*.25-this.cam.y*.009,
-        planetSize,planetSize
-      );
-      c.globalAlpha=1;
-
-      const moonX=w*.86-this.cam.x*.008;
-      const moonY=h*.21-this.cam.y*.006;
-      const moon=c.createRadialGradient(
-        moonX-8,moonY-12,0,moonX,moonY,29
-      );
-
-      moon.addColorStop(0,'#6d6084');
-      moon.addColorStop(.45,'#29243e');
-      moon.addColorStop(1,'#070a15');
-
-      c.fillStyle=moon;
-      c.beginPath();
-      c.arc(moonX,moonY,29,0,Math.PI*2);
-      c.fill();
-
-      const count=this.low?85:this.stars.length;
-
-      for(let i=0;i<count;i++){
-        const s=this.stars[i],z=s.d;
-
-        const sx=wrap(
-          s.x*(w+80)-this.cam.x*z*.11-now*.0018*z,
-          w+80
-        )-40;
-
-        const sy=wrap(
-          s.y*(h+80)-this.cam.y*z*.11+now*.003*z,
-          h+80
-        )-40;
-
-        c.globalAlpha=.25+z*.55+
-          (this.reduced?0:Math.sin(now*.001+s.phase)*.12);
-
-        c.fillStyle=i%4?'#c8ddff':'#8ca8ff';
-
-        const streak=flying&&!this.reduced?
-          (3+speed*30)*z:
-          0;
-
-        if(streak>3){
-          const norm=Math.hypot(vx,vy);
-          c.strokeStyle=c.fillStyle;
-          c.lineWidth=s.radius*.7;
-          c.beginPath();
-          c.moveTo(sx,sy);
-          c.lineTo(
-            sx-vx/norm*streak,
-            sy-vy/norm*streak
-          );
-          c.stroke();
-        }else{
-          c.beginPath();
-          c.arc(
-            sx,sy,s.radius*(.65+z*.35),
-            0,Math.PI*2
-          );
-          c.fill();
-        }
-      }
-
-      c.globalAlpha=1;
-
-      if(!this.reduced){
-        for(let i=0;i<(this.low?1:3);i++){
-          const cycle=wrap(now*.00008+i*.31,1);
-          if(cycle>.24)continue;
-
-          const mx=w*(1.15-cycle*5)+i*70;
-          const my=h*.12+cycle*h*1.8+i*40;
-
-          const tail=c.createLinearGradient(
-            mx,my,mx+70,my-30
-          );
-
-          tail.addColorStop(0,'#c8e9ffb0');
-          tail.addColorStop(1,'#9aceff00');
-
-          c.strokeStyle=tail;
-          c.lineWidth=1.4;
-          c.beginPath();
-          c.moveTo(mx,my);
-          c.lineTo(mx+70,my-30);
-          c.stroke();
-        }
-      }
-
-      const model=game.round?game.round.model:game.ship;
-
-      const scale=Math.min(
-        1.15,
-        Math.max(.6,Math.min(w/480,b.height/420))
-      )*this.zoom;
-
-      const engine=flying?
-        .55+speed*.45:
-        countdown?
-          .15+.3*(1-Math.max(
-            0,(r.startsAt-now)/SETTINGS.countdownMs
-          )):
-          0;
-
-      if(alive){
-        const aura=c.createRadialGradient(
-          x,y,0,x,y,100*scale
-        );
-
-        aura.addColorStop(0,SHIPS[model].color+'15');
-        aura.addColorStop(1,SHIPS[model].color+'00');
-        c.fillStyle=aura;
-        c.fillRect(
-          x-100*scale,y-100*scale,
-          200*scale,200*scale
-        );
-
-        c.save();
-        c.translate(x,y);
-        c.rotate(this.angle);
-        c.scale(scale,scale);
-        this.ship(c,model,engine,now);
-        c.restore();
-
-        this.emission+=dt*(this.low?25:55)*engine;
-
-        while(
-          this.emission>=1&&
-          this.particles.length<(this.low?130:300)
-        ){
-          this.emission--;
-
-          const a=this.angle+Math.PI/2;
-          const distance=38*scale;
-          const v=65+Math.random()*100;
-
-          this.particles.push({
-            x:x+Math.cos(a)*distance+(Math.random()-.5)*7,
-            y:y+Math.sin(a)*distance,
-            vx:Math.cos(a)*v+(Math.random()-.5)*30,
-            vy:Math.sin(a)*v+(Math.random()-.5)*30,
-            life:.4+Math.random()*.7,
-            max:1.1,
-            size:1+Math.random()*3,
-            color:SHIPS[model].flame,
-            smoke:Math.random()>.6
-          });
-        }
-
-        this.emission=Math.min(this.emission,2);
-      }
-
-      for(let i=this.particles.length-1;i>=0;i--){
-        const p=this.particles[i];
-        p.life-=dt;
-
-        if(p.life<=0){
-          this.particles.splice(i,1);
-          continue;
-        }
-
-        p.x+=p.vx*dt;
-        p.y+=p.vy*dt;
-        p.vx*=Math.exp(-dt*.9);
-        p.vy*=Math.exp(-dt*.9);
-
-        c.globalAlpha=Math.min(1,p.life/p.max)*
-          (p.smoke?.13:.8);
-
-        c.fillStyle=p.smoke?'#9bb4d0':p.color;
-
-        const radius=p.smoke?
-          p.size+(p.max-p.life)*8:
-          p.size*Math.min(1,p.life*2);
-
-        c.beginPath();
-        c.arc(
-          p.x,p.y,Math.max(.1,radius),
-          0,Math.PI*2
-        );
-        c.fill();
-      }
-
-      c.globalAlpha=1;
-
-      if(age>=0&&age<1.4){
-        const rad=30+age*260;
-        c.strokeStyle='rgba(255,181,115,'+
-          (1-age/1.4)*.65+')';
-        c.lineWidth=3*(1-age/1.4)+.3;
-
-        c.beginPath();
-        c.arc(x,y,rad,0,Math.PI*2);
-        c.stroke();
-
-        if(age<.22){
-          c.fillStyle='rgba(255,214,171,'+
-            (1-age/.22)*.2+')';
-          c.fillRect(0,0,w,h);
-        }
-      }
-
-      if(successAge>=0&&successAge<1.1){
-        c.strokeStyle='rgba(115,255,197,'+
-          (1-successAge/1.1)*.55+')';
-        c.lineWidth=2;
-        c.beginPath();
-        c.arc(
-          x,y,45+successAge*180,
-          0,Math.PI*2
-        );
-        c.stroke();
-      }
-
-      c.restore();
-
-      const vignette=c.createRadialGradient(
-        w/2,h*.43,Math.min(w,h)*.23,
-        w/2,h*.48,Math.max(w,h)*.75
-      );
-
-      vignette.addColorStop(0,'#02040a00');
-      vignette.addColorStop(1,'#02040aa8');
-      c.fillStyle=vignette;
-      c.fillRect(0,0,w,h);
-    }
-  }
-
-  /* Synthesized sounds: no audio files or network requests. */
-  class Synth {
-    constructor(enabled) {
-      this.enabled=enabled;
-      this.ctx=null;
-      this.lastUpdate=0;
-    }
-
-    async unlock() {
-      if(!this.enabled)return;
-
-      const Audio=window.AudioContext||
-        window.webkitAudioContext;
-
-      if(!Audio)return;
-
-      try{
-        if(!this.ctx){
-          const c=this.ctx=new Audio();
-
-          this.master=c.createGain();
-          this.master.gain.value=.23;
-          this.master.connect(c.destination);
-
-          this.motor=c.createOscillator();
-          this.motor.type='sawtooth';
-
-          this.motorFilter=c.createBiquadFilter();
-          this.motorFilter.type='lowpass';
-
-          this.motorGain=c.createGain();
-          this.motorGain.gain.value=0;
-
-          this.motor.connect(this.motorFilter);
-          this.motorFilter.connect(this.motorGain);
-          this.motorGain.connect(this.master);
-          this.motor.start();
-
-          this.noise=c.createBuffer(
-            1,c.sampleRate,c.sampleRate
-          );
-
-          const samples=this.noise.getChannelData(0);
-
-          for(let i=0;i<samples.length;i++){
-            samples[i]=Math.random()*2-1;
-          }
-
-          this.air=c.createBufferSource();
-          this.air.buffer=this.noise;
-          this.air.loop=true;
-
-          this.airFilter=c.createBiquadFilter();
-          this.airFilter.type='bandpass';
-          this.airFilter.Q.value=.7;
-
-          this.airGain=c.createGain();
-          this.airGain.gain.value=0;
-
-          this.air.connect(this.airFilter);
-          this.airFilter.connect(this.airGain);
-          this.airGain.connect(this.master);
-          this.air.start();
-        }
-
-        if(this.ctx.state==='suspended'){
-          await this.ctx.resume();
-        }
-      }catch{}
-    }
-
-    pause() {
-      if(this.ctx?.state==='running'){
-        this.ctx.suspend().catch(()=>{});
-      }
-    }
-
-    tone(freq,end,duration,volume=.2,type='sine',offset=0) {
-      if(
-        !this.enabled||
-        !this.ctx||
-        this.ctx.state!=='running'
-      )return;
-
-      const c=this.ctx;
-      const t=c.currentTime+offset;
-      const o=c.createOscillator();
-      const g=c.createGain();
-
-      o.type=type;
-      o.frequency.setValueAtTime(freq,t);
-      o.frequency.exponentialRampToValueAtTime(
-        Math.max(1,end),t+duration
-      );
-
-      g.gain.setValueAtTime(.001,t);
-      g.gain.exponentialRampToValueAtTime(volume,t+.008);
-      g.gain.exponentialRampToValueAtTime(.001,t+duration);
-
-      o.connect(g);
-      g.connect(this.master);
-
-      o.start(t);
-      o.stop(t+duration+.02);
-
-      o.onended=()=>{
-        o.disconnect();
-        g.disconnect();
-      };
-    }
-
-    play(kind) {
-      if(kind==='click'){
-        this.tone(450,680,.06,.12,'triangle');
-      }
-
-      if(kind==='tick'){
-        this.tone(620,620,.11,.16);
-      }
-
-      if(kind==='launch'){
-        this.tone(45,170,.8,.28,'sawtooth');
-        this.tone(120,65,1,.2,'triangle');
-      }
-
-      if(kind==='speed'){
-        this.tone(220,580,.28,.07,'sine');
-      }
-
-      if(kind==='cash'){
-        [523.25,659.25,783.99,1046.5].forEach(
-          (n,i)=>this.tone(n,n*1.004,.35,.2,'sine',i*.08)
-        );
-      }
-
-      if(
-        kind==='crash'&&
-        this.enabled&&
-        this.ctx?.state==='running'
-      ){
-        const c=this.ctx;
-        const t=c.currentTime;
-        const s=c.createBufferSource();
-        const g=c.createGain();
-        const f=c.createBiquadFilter();
-
-        s.buffer=this.noise;
-        f.type='lowpass';
-        f.frequency.setValueAtTime(3500,t);
-        f.frequency.exponentialRampToValueAtTime(70,t+.9);
-
-        g.gain.setValueAtTime(.85,t);
-        g.gain.exponentialRampToValueAtTime(.001,t+.95);
-
-        s.connect(f);
-        f.connect(g);
-        g.connect(this.master);
-
-        s.start(t);
-        s.stop(t+.96);
-
-        s.onended=()=>{
-          s.disconnect();
-          f.disconnect();
-          g.disconnect();
-        };
-
-        this.tone(90,23,.7,.6,'sine');
-      }
-    }
-
-    engine(power,now) {
-      if(!this.ctx||now-this.lastUpdate<90)return;
-      this.lastUpdate=now;
-
-      const c=this.ctx;
-      const t=c.currentTime;
-
-      const set=(p,v)=>{
-        p.cancelScheduledValues(t);
-        p.setTargetAtTime(v,t,.09);
-      };
-
-      set(this.motorGain.gain,power*.11);
-      set(this.airGain.gain,power*.18);
-      set(this.motor.frequency,45+power*110);
-      set(this.motorFilter.frequency,160+power*850);
-      set(this.airFilter.frequency,280+power*2100);
-    }
-  }
-
-  /* Formatting and persistence. */
-  const $ = id => document.getElementById(id);
-
-  const fa = value => String(value)
-    .replace(/\d/g,d=>PERSIAN[Number(d)])
-    .replace(/\./g,'٫');
-
-  const multi = cents => fa((cents/100).toFixed(2))+'×';
-
-  function money(value, compact=false) {
-    const amount=BigInt(value);
-    const digits=(amount/100n).toString();
-    const fraction=amount%100n;
-
-    if(compact&&digits.length>13){
-      return fa(digits[0]+'.'+digits.slice(1,4))+
-        ' × ۱۰^'+fa(digits.length-1);
-    }
-
-    return fa(
-      digits.replace(/\B(?=(\d{3})+(?!\d))/g,'٬')+
-      (fraction?'.'+String(fraction).padStart(2,'0'):'')
-    );
-  }
-
-  const STORAGE='rocket-infinite-space-v1';
-  let storageOK=true;
-
-  function storageWarning() {
-    storageOK=false;
-    $('save-warning').textContent=
-      'ذخیره‌سازی مرورگر در دسترس نیست؛ آمار فقط در این صفحه می‌ماند.';
-  }
-
-  function saveData(data) {
-    try{
-      // One storage record makes the stats and active round consistent.
-      localStorage.setItem(STORAGE,JSON.stringify(data));
-    }catch{
-      storageWarning();
-    }
-  }
-
-  function loadData() {
-    try{
-      const raw=localStorage.getItem(STORAGE);
-      if(!raw)return emptyData();
-
-      const input=JSON.parse(raw);
-      const s=input.stats;
-
-      const int=(n,min,max)=>
-        Number.isSafeInteger(n)&&n>=min&&n<=max;
-
-      const amount=n=>
-        typeof n==='string'&&/^\d{1,140}$/.test(n);
-
-      const validCash=(cash,stake,crash)=>
-        cash===null||
-        (
-          cash&&
-          int(cash.cents,100,crash)&&
-          amount(cash.prize)&&
-          BigInt(cash.prize)===
-            BigInt(stake)*BigInt(cash.cents)/100n
-        );
-
-      const validRound=r=>
-        r&&
-        int(r.crash,100,SETTINGS.maxCrashCents)&&
-        amount(r.stake)&&
-        BigInt(r.stake)>0n&&
-        int(r.model,0,7)&&
-        validCash(r.cash,r.stake,r.crash);
-
-      if(
-        input.version!==1||
-        !s||
-        !['rounds','wins','losses'].every(
-          k=>int(s[k],0,Number.MAX_SAFE_INTEGER-1)
-        )||
-        s.rounds!==s.wins+s.losses||
-        !amount(s.won)||
-        !amount(s.lost)||
-        !int(s.best,0,SETTINGS.maxCrashCents)||
-        !Array.isArray(input.history)||
-        !input.history.every(validRound)
-      ){
-        throw Error('Invalid saved data');
-      }
-
-      if(
-        input.active&&
-        (
-          !validRound(input.active)||
-          input.active.recorded!==Boolean(input.active.cash)
-        )
-      ){
-        throw Error('Invalid active round');
-      }
-
-      return {
-        version:1,
-        stats:{
-          rounds:s.rounds,wins:s.wins,losses:s.losses,
-          won:s.won,lost:s.lost,best:s.best
-        },
-        history:input.history.slice(0,SETTINGS.historyLimit),
-        active:input.active||null
-      };
-    }catch{
-      try{
-        if(localStorage.getItem(STORAGE)){
-          $('save-warning').textContent=
-            'دادهٔ ذخیره‌شده معتبر نبود؛ آمار تازه آغاز شد.';
-        }
-      }catch{
-        storageWarning();
-      }
-
-      return emptyData();
-    }
-  }
-
-  const hasCrypto=
-    typeof globalThis.crypto?.getRandomValues==='function';
-
-  function secureRandom() {
-    const buffer=new Uint32Array(1);
-    crypto.getRandomValues(buffer);
-    // Open interval (0,1), including neither endpoint.
-    return (buffer[0]+.5)/4294967296;
-  }
-
-  let audioEnabled=true;
-  try{
-    audioEnabled=localStorage.getItem(STORAGE+'-sound')!=='off';
-  }catch{}
-
-  const sound=new Synth(audioEnabled);
-
-  // If crypto is absent, the UI disables starting.
-  // The fallback is only used to initialize the displayed ship.
-  const game=new FlightGame(
-    hasCrypto?secureRandom:()=>.5,
-    loadData(),
-    saveData
-  );
-
-  const scene=new SpaceScene($('space'),$('arena'));
-  const input=$('stake');
-  const mainButton=$('action');
-  const quickButtons=[
-    ...document.querySelectorAll('[data-stake]')
-  ];
-
-  let toastTimer;
-  let lastCountdown=-1;
-  let lastUi=0;
-  let lastFrame=0;
-  let raf=0;
-  let slowTime=0;
-  let speedMilestone=0;
-
-  function toast(text) {
-    $('toast').textContent=text;
-    $('toast').classList.add('show');
-
-    clearTimeout(toastTimer);
-    toastTimer=setTimeout(
-      ()=>$('toast').classList.remove('show'),
-      3500
-    );
-  }
-
-  function soundUI() {
-    $('sound-icon').setAttribute(
-      'href',sound.enabled?'#i-sound':'#i-muted'
-    );
-
-    $('sound-btn').setAttribute(
-      'aria-pressed',String(sound.enabled)
-    );
-
-    $('sound-btn').setAttribute(
-      'aria-label',
-      sound.enabled?'خاموش کردن صدا':'روشن کردن صدا'
-    );
-  }
-
-  function toggleSound() {
-    sound.enabled=!sound.enabled;
-    soundUI();
-
-    try{
-      localStorage.setItem(
-        STORAGE+'-sound',sound.enabled?'on':'off'
-      );
-    }catch{}
-
-    if(sound.enabled){
-      sound.unlock().then(()=>sound.play('click'));
-    }else{
-      sound.pause();
-    }
-  }
-
-  function showStats() {
-    const s=game.data.stats;
-
-    for(const name of ['rounds','wins','losses']){
-      $('stat-'+name).textContent=fa(s[name]);
-    }
-
-    for(const name of ['won','lost']){
-      $('stat-'+name).textContent=money(s[name],true);
-      $('stat-'+name).title=money(s[name]);
-    }
-
-    $('stat-best').textContent=s.best?multi(s.best):'—';
-  }
-
-  function showHistory() {
-    const parent=$('history');
-    parent.replaceChildren();
-
-    if(!game.data.history.length){
-      const text=document.createElement('span');
-      text.className='empty-history';
-      text.textContent='اولین پروازت را آغاز کن';
-      parent.append(text);
-      return;
-    }
-
-    for(const row of game.data.history){
-      const button=document.createElement('button');
-
-      button.className='history-chip '+
-        (
-          row.crash>=1000?'epic':
-          row.crash>=500?'high':
-          row.crash>=200?'mid':''
-        )+
-        (row.cash?' win':'');
-
-      button.textContent=multi(row.crash);
-
-      const description=SHIPS[row.model].name+
-        ' · انفجار '+multi(row.crash)+' · '+
-        (
-          row.cash?
-            'برداشت '+multi(row.cash.cents)+
-              ' / '+money(row.cash.prize)+' اعتبار':
-            'باخت '+money(row.stake)+' اعتبار'
-        );
-
-      button.title=description;
-      button.setAttribute('aria-label',description);
-      button.addEventListener(
-        'click',()=>toast(description)
-      );
-
-      parent.append(button);
-    }
-  }
-
-  function eventQueue(now) {
-    for(const event of game.events.splice(0)){
-      const fresh=now-event.at<350;
-
-      if(event.type==='countdown'){
-        $('cash-banner').classList.remove('show');
-        lastCountdown=-1;
-        speedMilestone=0;
-        scene.seed=Math.random()*6.28;
-        $('announce').textContent='شمارش معکوس آغاز شد.';
-      }
-
-      if(event.type==='launch'){
-        if(fresh){
-          scene.launch=now;
-          sound.play('launch');
-        }
-
-        $('announce').textContent=
-          'موشک پرواز کرد؛ امکان برداشت فعال است.';
-      }
-
-      if(event.type==='cash'){
-        if(fresh){
-          scene.burst('cash',now);
-          sound.play('cash');
-        }
-
-        $('cash-value').textContent=
-          money(game.round.cash.prize,true);
-        $('cash-value').title=
-          money(game.round.cash.prize);
-        $('cash-banner').classList.add('show');
-
-        $('announce').textContent=
-          'برداشت موفق در ضریب '+
-          multi(game.round.cash.cents);
-      }
-
-      if(event.type==='crash'){
-        if(fresh){
-          scene.burst('crash',now);
-          sound.play('crash');
-        }
-
-        const row=game.data.history[0];
-        $('announce').textContent=row.cash?
-          'پرواز پایان یافت. برداشت شما محفوظ است.':
-          'موشک منفجر شد! شرط این دور باخت.';
-
-        showHistory();
-      }
-
-      if(event.type==='ready'){
-        $('announce').textContent=
-          'سفینهٔ بعدی آمادهٔ پرواز است.';
-      }
-
-      if(event.type==='recovered'){
-        toast(
-          'دور بازِ قبلی پایان یافت؛ برداشت ثبت‌شده محفوظ مانده است.'
-        );
-      }
-
-      showStats();
-    }
-  }
-
-  function updateUI(now) {
-    const state=game.state;
-    const r=game.round;
-    const cents=game.cents(now);
-
-    const ready=state==='READY';
-    const countdown=state==='COUNTDOWN';
-    const flying=state==='FLYING';
-    const ended=state==='CRASHED'||state==='ROUND_END';
-
-    input.disabled=!ready;
-    quickButtons.forEach(b=>b.disabled=!ready);
-    $('reset-btn').disabled=!ready;
-
-    mainButton.className='action '+
-      (
-        ended?(r.cash?'won':'lost'):
-        flying?(r.cash?'won':'cash'):
-        countdown?'wait':''
-      );
-
-    mainButton.disabled=
-      !hasCrypto||countdown||ended||Boolean(flying&&r.cash);
-
-    $('multiplier').className='multiplier '+
-      (ended?'crashed':countdown?'countdown':'');
-
-    if(countdown){
-      const digit=Math.max(
-        1,Math.ceil((r.startsAt-now)/800)
-      );
-
-      $('multiplier').textContent=fa(digit);
-
-      if(lastCountdown!==digit){
-        lastCountdown=digit;
-        sound.play('tick');
-      }
-    }else{
-      $('multiplier').textContent=multi(ready?100:cents);
-    }
-
-    $('phase-label').textContent=
-      ready?'آمادهٔ پرواز':
-      countdown?'راه‌اندازی پیشرانه':
-      flying?'پرواز در فضای بی‌نهایت':
-      'پایان مأموریت';
-
-    $('status').textContent=
-      ready?'قبل از انفجار، اعتبارت را برداشت کن.':
-      countdown?'موتورها روشن؛ آمادهٔ جهش به فضا…':
-      flying?
-        (
-          r.cash?
-            'برداشتت ثبت شد؛ پایان پرواز را تماشا کن.':
-            'زمان برداشت دست توست؛ پایان پرواز نامعلوم است.'
-        ):
-        r.cash?
-          'پرواز پایان یافت؛ برداشتت محفوظ است.':
-          'موشک منفجر شد! شرط این دور باخت';
-
-    const current=ready?
-      (parseStake(input.value)||0n):
-      r.cash?BigInt(r.cash.prize):
-      ended?0n:
-      BigInt(r.stake)*BigInt(cents)/100n;
-
-    $('payout').textContent=money(current,true);
-    $('payout').title=money(current);
-
-    $('payout-label').textContent=r?.cash?
-      'برداشت ثبت‌شده':
-      'ارزش لحظه‌ای پرواز';
-
-    let label='شروع پرواز';
-    let sub='یک موشک؛ یک فرصت';
-    let icon='#i-rocket';
-
-    if(countdown){
-      label='آمادهٔ پرتاب…';
-      sub='پیشرانه در حال روشن شدن';
-    }
-
-    if(flying&&!r.cash){
-      label='برداشت '+money(current,true);
-      sub='اعتبار مجازی · همین لحظه';
-      icon='#i-credit';
-    }
-
-    if(r?.cash){
-      label='برداشت ثبت شد';
-      sub=money(r.cash.prize,true)+' اعتبار';
-      icon='#i-check';
-    }
-
-    if(ended&&!r.cash){
-      label='موشک منفجر شد';
-      sub='سفینهٔ بعدی در راه است';
-    }
-
-    if(ended&&r.cash){
-      sub='بردت محفوظ است · دور بعد در راه';
-    }
-
-    $('action-label').textContent=label;
-    $('action-sub').textContent=sub;
-    $('action-icon').setAttribute('href',icon);
-
-    mainButton.setAttribute(
-      'aria-label',
-      flying&&!r.cash?
-        'برداشت '+money(current)+' اعتبار مجازی':
-        label
-    );
-
-    const ship=SHIPS[r?r.model:game.ship];
-    $('ship-name').textContent=ship.name;
-    $('ship-code').textContent=ship.code;
-
-    $('telemetry').textContent=flying?
-      'پیشرانه '+
-        fa(Math.min(
-          100,Math.floor(50+(now-r.startsAt)/600)
-        ))+
-        '٪ · ارتباط پایدار':
-      countdown?'در حال آماده‌سازی سامانه‌ها':
-      ended?'مأموریت ثبت شد':
-      'سامانه‌های پرواز آماده‌اند';
-
-    $('sector').textContent='SECTOR '+
-      String(Math.min(
-        99,
-        1+Math.floor(
-          (r?Math.max(0,now-r.startsAt):0)/5000
-        )
-      )).padStart(2,'0');
-
-    $('quality-label').textContent=scene.low?
-      'FLIGHT SYSTEM / ECO':
-      'FLIGHT SYSTEM / ONLINE';
-
-    if(flying){
-      const milestone=[200,300,500,1000,2000,5000]
-        .filter(n=>cents>=n).length;
-
-      if(milestone>speedMilestone){
-        speedMilestone=milestone;
-        sound.play('speed');
-      }
-    }
-  }
-
-  function primaryAction() {
-    // Preserve the intended action before resolving elapsed time.
-    const state=game.state;
-    const now=performance.now();
-
-    sound.unlock().then(()=>sound.play('click'));
-
-    if(state==='READY'){
-      if(!hasCrypto){
-        toast(
-          'این مرورگر تولید عدد تصادفی امن را پشتیبانی نمی‌کند.'
-        );
-        return;
-      }
-
-      const stake=parseStake(input.value);
-
-      if(stake===null){
-        input.setAttribute('aria-invalid','true');
-        toast('مبلغ مثبت با حداکثر دو رقم اعشار وارد کن.');
-        input.focus();
-        return;
-      }
-
-      input.removeAttribute('aria-invalid');
-      input.value=money(stake);
-      game.start(stake,now);
-    }else if(state==='FLYING'){
-      const result=game.cashOut(now);
-
-      if(!result&&!game.round?.cash){
-        toast('پرواز پیش از ثبت برداشت پایان یافت.');
-      }
-    }
-
-    eventQueue(now);
-    updateUI(now);
-  }
-
-  mainButton.addEventListener('click',primaryAction);
-
-  quickButtons.forEach(button=>{
-    button.addEventListener('click',()=>{
-      if(game.state!=='READY')return;
-
-      input.value=money(
-        BigInt(button.dataset.stake)*100n
-      );
-      input.removeAttribute('aria-invalid');
-
-      sound.unlock().then(()=>sound.play('click'));
-      updateUI(performance.now());
-    });
-  });
-
-  input.addEventListener('input',()=>{
-    input.removeAttribute('aria-invalid');
-
-    if(game.state==='READY'){
-      updateUI(performance.now());
-    }
-  });
-
-  input.addEventListener('blur',()=>{
-    const amount=parseStake(input.value);
-    if(amount!==null)input.value=money(amount);
-  });
-
-  $('sound-btn').addEventListener('click',toggleSound);
-
-  $('stats-btn').addEventListener('click',()=>{
-    showStats();
-    $('stats-dialog').showModal();
-  });
-
-  $('help-btn').addEventListener(
-    'click',()=>$('help-dialog').showModal()
-  );
-
-  $('reset-btn').addEventListener('click',()=>{
-    if(game.state==='READY'){
-      $('reset-dialog').showModal();
-    }
-  });
-
-  $('confirm-reset').addEventListener('click',()=>{
-    if(game.reset()){
-      showHistory();
-      showStats();
-      $('cash-banner').classList.remove('show');
-      toast('آمار و تاریخچه پاک شد.');
-    }
-
-    $('reset-dialog').close();
-  });
-
-  document.querySelectorAll('[data-close]').forEach(b=>{
-    b.addEventListener(
-      'click',()=>b.closest('dialog').close()
-    );
-  });
-
-  document.querySelectorAll('dialog').forEach(d=>{
-    d.addEventListener('click',event=>{
-      if(event.target!==d)return;
-
-      const r=d.getBoundingClientRect();
-
-      if(
-        event.clientX<r.left||
-        event.clientX>r.right||
-        event.clientY<r.top||
-        event.clientY>r.bottom
-      ){
-        d.close();
-      }
-    });
-  });
-
-  document.addEventListener('keydown',event=>{
-    if(
-      event.repeat||
-      document.querySelector('dialog[open]')||
-      /^(INPUT|TEXTAREA|BUTTON)$/.test(event.target.tagName)||
-      event.target.isContentEditable
-    )return;
-
-    if(event.code==='Space'){
-      event.preventDefault();
-      primaryAction();
-    }
-
-    if(event.code==='KeyM'){
-      toggleSound();
-    }
-  });
-
-  function frame(now) {
-    if(document.hidden){
-      raf=0;
-      return;
-    }
-
-    const raw=lastFrame?
-      (now-lastFrame)/1000:
-      1/60;
-
-    const dt=Math.min(.05,raw);
-    lastFrame=now;
-
-    game.advance(now);
-    eventQueue(now);
-    scene.render(now,dt,game);
-
-    if(now-lastUi>33){
-      lastUi=now;
-      updateUI(now);
-    }
-
-    const r=game.round;
-
-    sound.engine(
-      game.state==='FLYING'?
-        Math.min(1,.5+(now-r.startsAt)/30000):
-        game.state==='COUNTDOWN'?.22:
-        0,
-      now
-    );
-
-    // Lower rendering cost when sustained frame times are poor.
-    if(!scene.low){
-      slowTime=raw>.035?
-        slowTime+Math.min(raw,.1):
-        Math.max(0,slowTime-dt*.25);
-
-      if(slowTime>2.5){
-        scene.low=true;
-        scene.resize();
-      }
-    }
-
-    raf=requestAnimationFrame(frame);
-  }
-
-  function suspend() {
-    cancelAnimationFrame(raf);
-    raf=0;
-    lastFrame=0;
-    sound.pause();
-  }
-
-  function resume() {
-    if(document.hidden)return;
-
-    game.advance(performance.now());
-    eventQueue(performance.now());
-    updateUI(performance.now());
-
-    if(sound.ctx&&sound.enabled){
-      sound.unlock();
-    }
-
-    if(!raf){
-      raf=requestAnimationFrame(frame);
-    }
-  }
-
-  document.addEventListener(
-    'visibilitychange',
-    ()=>document.hidden?suspend():resume()
-  );
-
-  window.addEventListener('pagehide',suspend);
-  window.addEventListener('pageshow',resume);
-
-  window.addEventListener(
-    'resize',()=>scene.resize(),{passive:true}
-  );
-
-  if(window.visualViewport){
-    window.visualViewport.addEventListener(
-      'resize',()=>scene.resize(),{passive:true}
-    );
-  }
-
-  soundUI();
-  showStats();
-  showHistory();
-
-  if(!hasCrypto){
-    $('status').textContent=
-      'برای بازی از مرورگری با پشتیبانی crypto استفاده کنید.';
-    toast('تولید تصادفی امن در این مرورگر در دسترس نیست.');
-  }
-
-  eventQueue(performance.now());
-  updateUI(performance.now());
-  resume();
-})();
-</script>
+<div class="toast" id="toast"></div>
 </body>
 </html>
